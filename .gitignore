@@ -3,7 +3,7 @@
 .env.local
 .env.production
 .env.staging
-requirements.txt
+#requirements.txt
 # Python
 __pycache__/
 *.py[cod]
