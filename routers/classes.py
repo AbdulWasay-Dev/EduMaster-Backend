@@ -31,6 +31,7 @@ class ClassResponse(BaseModel):
     subject_area: Optional[str] = None
     academic_year: Optional[str] = None
     is_active: Optional[bool] = True
+    teacher_id: Optional[str] = None
     created_at: str
 
 
@@ -62,6 +63,7 @@ async def create_class(
             subject_area=created.get("subject_area"),
             academic_year=created.get("academic_year"),
             is_active=created.get("is_active", True),
+            teacher_id=str(created["teacher_id"]) if created.get("teacher_id") else str(current_user["id"]),
             created_at=str(created["created_at"]),
         )
     except HTTPException:
@@ -87,6 +89,7 @@ async def list_classes(current_user: dict = Depends(require_teacher())):
                     "subject_area": r.get("subject_area"),
                     "academic_year": r.get("academic_year"),
                     "is_active": r.get("is_active", True),
+                    "teacher_id": str(r["teacher_id"]) if r.get("teacher_id") else str(current_user["id"]),
                     "created_at": str(r["created_at"]),
                 }
                 for r in rows
@@ -125,10 +128,86 @@ async def get_class(
             "subject_area": class_obj.get("subject_area"),
             "academic_year": class_obj.get("academic_year"),
             "is_active": class_obj.get("is_active", True),
+            "teacher_id": str(class_obj["teacher_id"]) if class_obj.get("teacher_id") else str(current_user["id"]),
             "created_at": str(class_obj["created_at"]),
         }
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error getting class {class_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.put("/{class_id}", response_model=ClassResponse)
+async def update_class(
+    class_id: str,
+    payload: ClassCreate,
+    current_user: dict = Depends(require_teacher())
+):
+    """Update a class"""
+    try:
+        db = await get_database()
+        classes = await db.get_classes(current_user["id"])
+        class_ids = [str(c["id"]) for c in classes]
+        if class_id not in class_ids:
+            raise HTTPException(status_code=403, detail="Access denied to this class")
+
+        import uuid
+        async with db.connection() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE classes
+                SET name = $1, description = $2, grade_level = $3, subject_area = $4, academic_year = $5, updated_at = NOW()
+                WHERE id = $6
+                RETURNING *
+                """,
+                payload.name,
+                payload.description,
+                payload.grade_level,
+                payload.subject_area,
+                payload.academic_year,
+                uuid.UUID(class_id),
+            )
+            updated = dict(row) if row else None
+        if not updated:
+            raise HTTPException(status_code=500, detail="Failed to update class")
+        return ClassResponse(
+            id=str(updated["id"]),
+            name=updated["name"],
+            description=updated.get("description", ""),
+            grade_level=updated.get("grade_level"),
+            subject_area=updated.get("subject_area"),
+            academic_year=updated.get("academic_year"),
+            is_active=updated.get("is_active", True),
+            teacher_id=str(updated["teacher_id"]) if updated.get("teacher_id") else str(current_user["id"]),
+            created_at=str(updated["created_at"]),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating class {class_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.delete("/{class_id}")
+async def delete_class(
+    class_id: str,
+    current_user: dict = Depends(require_teacher())
+):
+    """Delete a class"""
+    try:
+        db = await get_database()
+        classes = await db.get_classes(current_user["id"])
+        class_ids = [str(c["id"]) for c in classes]
+        if class_id not in class_ids:
+            raise HTTPException(status_code=403, detail="Access denied to this class")
+
+        import uuid
+        async with db.connection() as conn:
+            await conn.execute("DELETE FROM classes WHERE id = $1", uuid.UUID(class_id))
+        return {"deleted": True, "class_id": class_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting class {class_id}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")

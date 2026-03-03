@@ -265,6 +265,19 @@ class DatabaseService:
             logger.error(f"Error getting document {document_id}: {e}")
             return None
 
+    async def get_document_chunks(self, document_id: str) -> List[Dict[str, Any]]:
+        """Get text chunks for a document"""
+        try:
+            async with self.connection() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, chunk_index, text, metadata FROM doc_chunks WHERE document_id = $1 ORDER BY chunk_index",
+                    uuid.UUID(document_id)
+                )
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting chunks for document {document_id}: {e}")
+            return []
+
     async def update_document_status(self, document_id: str, status: str) -> bool:
         """Update document processing status"""
         try:

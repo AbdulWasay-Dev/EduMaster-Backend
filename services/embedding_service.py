@@ -125,11 +125,16 @@ class EmbeddingService:
         return cleaned
 
 
-# Global singleton
-embedding_service = EmbeddingService()
+# Lazily-initialised singleton — model is NOT loaded at import time,
+# only on first actual use. This keeps startup fast and avoids reloading
+# the heavy transformer weights on every watchfiles-triggered restart.
+_embedding_service: Optional["EmbeddingService"] = None
 
 
-def get_embedding_service() -> EmbeddingService:
-    """Return the global embedding service instance."""
-    return embedding_service
+def get_embedding_service() -> "EmbeddingService":
+    """Return the global embedding service instance (created on first call)."""
+    global _embedding_service
+    if _embedding_service is None:
+        _embedding_service = EmbeddingService()
+    return _embedding_service
 

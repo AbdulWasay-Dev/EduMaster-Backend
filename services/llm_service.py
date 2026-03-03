@@ -96,7 +96,8 @@ class LLMService:
         question_count: int = 5,
         question_types: List[str] = None,
         difficulty_level: str = "medium",
-        subject_id: str = None
+        subject_id: str = None,
+        question_type_counts: Dict[str, int] = None
     ) -> Optional[List[Dict[str, Any]]]:
         """Generate questions from RAG-organized content with timeout handling"""
         try:
@@ -142,7 +143,8 @@ class LLMService:
             logger.info(f"Sending {len(combined_content)} characters to LLM for question generation")
 
             prompt = self._create_rag_question_generation_prompt(
-                combined_content, question_count, question_types, difficulty_level, subject_id
+                combined_content, question_count, question_types, difficulty_level, subject_id,
+                question_type_counts=question_type_counts
             )
 
             text: Optional[str] = None
@@ -370,30 +372,42 @@ Generate the questions now:
         count: int,
         types: List[str],
         difficulty: str,
-        subject_id: str = None
+        subject_id: str = None,
+        question_type_counts: Dict[str, int] = None
     ) -> str:
         """Create simplified prompt for RAG-based question generation"""
+        if question_type_counts:
+            type_spec = ", ".join(
+                f"exactly {v} {k.replace('_', ' ')}" for k, v in question_type_counts.items() if v > 0
+            )
+            count_line = f"Generate {count} questions total: {type_spec}."
+        else:
+            count_line = f"Create {count} questions from this content. Types: {', '.join(types)}."
+
         return f"""
-Create {count} questions from this content. Types: {', '.join(types)}. Difficulty: {difficulty}.
+{count_line} Difficulty: {difficulty}.
 
 CONTENT:
 {content}
 
 REQUIREMENTS:
-- Base questions on the content above
-- For MCQs: provide 4 options (A,B,C,D) with 1 correct
-- Include correct answers
+- Base questions strictly on the content above
+- For MCQ: provide exactly 4 options (plain text, no letter prefix) with 1 correct answer
+- Include correct answers for all question types
+- For essay/long_answer: provide a model answer
 - Make questions clear and specific
+- Use difficulty: {difficulty}
 
-FORMAT (JSON):
+FORMAT (return ONLY valid JSON, no extra text):
 {{
     "questions": [
         {{
             "question_text": "Your question here?",
-            "question_type": "mcq|short_answer",
-            "options": ["A", "B", "C", "D"] (MCQ only),
-            "correct_answer": "Answer here",
-            "max_score": 5
+            "question_type": "mcq|short_answer|long_answer|essay|true_false|fill_blank",
+            "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
+            "correct_answer": "Exact correct option text or answer",
+            "explanation": "Brief explanation",
+            "marks": 5
         }}
     ]
 }}
@@ -524,13 +538,18 @@ Grade the answer:
                         question['id'] = f"q{i+1}"
                     if 'question_number' not in question:
                         question['question_number'] = i + 1
+                    # Normalize marks: support both 'marks' and 'max_score' fields
+                    if 'marks' not in question:
+                        question['marks'] = question.get('max_score', 5)
                     if 'max_score' not in question:
-                        question['max_score'] = 5
+                        question['max_score'] = question.get('marks', 5)
                     if 'time_estimate' not in question:
                         question['time_estimate'] = "2-3 minutes"
                     if 'printable_format' not in question:
                         question['printable_format'] = self._format_question_for_print(question)
-                    
+                    # Add difficulty string if not present
+                    if 'difficulty' not in question:
+                        question['difficulty'] = 'medium'
                     # Ensure question text is properly formatted
                     if 'question_text' in question:
                         question['question_text'] = self._clean_question_text(question['question_text'])

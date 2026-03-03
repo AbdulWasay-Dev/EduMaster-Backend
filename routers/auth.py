@@ -109,13 +109,23 @@ async def register_user(user_data: UserRegister):
                 detail="Failed to create user"
             )
         
+        # Create access token so the user is logged in immediately after registration
+        access_token_expires = timedelta(minutes=settings.access_token_expire_minutes)
+        access_token = create_access_token(
+            data={"sub": str(user["id"]), "email": user["email"], "role": user["role"]},
+            expires_delta=access_token_expires
+        )
+
         logger.info(f"User registered successfully: {user_id}")
         return {
-            "message": "User registered successfully",
-            "user_id": str(user["id"]),
-            "email": user["email"],
-            "full_name": user["name"],
-            "role": user["role"]
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": {
+                "id": str(user["id"]),
+                "email": user["email"],
+                "full_name": user.get("name", ""),
+                "role": user.get("role", "teacher")
+            }
         }
         
     except HTTPException:
@@ -216,6 +226,15 @@ async def update_profile(
         if update_data:
             await db.update_teacher(str(current_user["id"]), update_data)
         
+        # Return updated profile as a User object
+        updated = await db.get_teacher(str(current_user["id"]))
+        if updated:
+            return UserProfile(
+                id=str(updated["id"]),
+                name=updated.get("name", ""),
+                email=updated["email"],
+                role=updated.get("role", "teacher"),
+            )
         return {"message": "Profile updated successfully"}
     except Exception as e:
         logger.error(f"Profile update error: {e}")

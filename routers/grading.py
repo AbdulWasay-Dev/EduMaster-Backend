@@ -17,7 +17,7 @@ router = APIRouter()
 class AnswerSheetGradingRequest(BaseModel):
     """Answer sheet grading request model"""
     paper_id: str
-    student_id: str
+    student_id: Optional[str] = None  # Optional to allow grading without linking to a student
     answer_sheet_image: str  # Base64 encoded image
     grading_mode: str = "auto"  # auto, semi_auto, manual
     strictness: str = "medium"  # lenient, medium, strict
@@ -33,11 +33,20 @@ class MultipleAnswerSheetGradingRequest(BaseModel):
 
 
 class GradingResponse(BaseModel):
-    """Minimal grading response model"""
+    """Full grading/submission response model"""
     submission_id: str
-    total_score: float
-    grade_percentage: float
-    feedback: str
+    id: str = ""  # alias for submission_id
+    paper_id: str = ""
+    student_id: Optional[str] = None
+    total_score: float = 0.0
+    max_score: float = 0.0
+    grade_percentage: float = 0.0
+    grade: str = ""
+    status: str = "graded"
+    feedback: str = ""
+    question_scores: list = []
+    graded_at: Optional[str] = None
+    created_at: Optional[str] = None
 
 
 class StudentResponse(BaseModel):
@@ -96,9 +105,18 @@ async def upload_and_grade_answer_sheet(
         
         return GradingResponse(
             submission_id=result["submission_id"],
+            id=result["submission_id"],
+            paper_id=request.paper_id,
+            student_id=request.student_id,
             total_score=result["total_score"],
+            max_score=result.get("max_score", result.get("total_marks", 0)),
             grade_percentage=result["grade_percentage"],
+            grade=result.get("grade", ""),
+            status="graded",
             feedback=result["feedback"],
+            question_scores=result.get("question_scores", []),
+            graded_at=result.get("graded_at"),
+            created_at=result.get("created_at"),
         )
         
     except HTTPException:
@@ -159,9 +177,18 @@ async def upload_and_grade_multiple_answer_sheets(
         
         return GradingResponse(
             submission_id=result["submission_id"],
+            id=result["submission_id"],
+            paper_id=request.paper_id,
+            student_id=request.student_id,
             total_score=result["total_score"],
+            max_score=result.get("max_score", result.get("total_marks", 0)),
             grade_percentage=result["grade_percentage"],
+            grade=result.get("grade", ""),
+            status="graded",
             feedback=result["feedback"],
+            question_scores=result.get("question_scores", []),
+            graded_at=result.get("graded_at"),
+            created_at=result.get("created_at"),
         )
         
     except HTTPException:
@@ -534,4 +561,129 @@ async def get_class_paper_results(
     except Exception as e:
         logger.error(f"Error getting class paper results: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoints required by the frontend API client (grading.ts)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/")
+async def list_submissions(
+    paper_id: Optional[str] = None,
+    current_teacher: dict = Depends(require_teacher_or_admin())
+):
+    """
+    List all submissions visible to the current teacher.
+    Optionally filter by paper_id.
+    """
+    try:
+        db = await get_database()
+        papers = await db.get_papers(current_teacher["id"])
+
+        all_submissions = []
+        for paper in papers:
+            if paper_id and str(paper["id"]) != paper_id:
+                continue
+            subs = await db.get_submissions(str(paper["id"]))
+            all_submissions.extend(subs)
+
+        return {
+            "submissions": [_serialize_submission(s) for s in all_submissions],
+            "total": len(all_submissions),
+        }
+    except Exception as e:
+        logger.error(f"Error listing submissions: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/{submission_id}")
+async def get_submission(
+    submission_id: str,
+    current_teacher: dict = Depends(require_teacher_or_admin())
+):
+    """Get a single submission by ID"""
+    try:
+        db = await get_database()
+        submission = await db.get_submission(submission_id)
+        if not submission:
+            raise HTTPException(status_code=404, detail="Submission not found")
+        # Verify ownership
+        paper = await db.get_paper(str(submission["paper_id"]))
+        if not paper or str(paper["owner_id"]) != str(current_teacher["id"]):
+            raise HTTPException(status_code=403, detail="Access denied to this submission")
+        return _serialize_submission(submission)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting submission {submission_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+class OverridePayload(BaseModel):
+    question_id: str
+    score: float
+    note: Optional[str] = None
+
+
+@router.post("/{submission_id}/override")
+async def override_submission_score(
+    submission_id: str,
+    payload: OverridePayload,
+    current_teacher: dict = Depends(require_teacher_or_admin())
+):
+    """Override the score for a specific question in a submission"""
+    try:
+        db = await get_database()
+        submission = await db.get_submission(submission_id)
+        if not submission:
+            raise HTTPException(status_code=404, detail="Submission not found")
+        paper = await db.get_paper(str(submission["paper_id"]))
+        if not paper or str(paper["owner_id"]) != str(current_teacher["id"]):
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        # Update grading_details in the submission_data JSON blob if present
+        import json as _json
+        raw = submission.get("submission_data")
+        if isinstance(raw, str):
+            sub_data = _json.loads(raw)
+        else:
+            sub_data = raw or {}
+
+        details = sub_data.get("question_details", [])
+        for item in details:
+            if str(item.get("question_id", "")) == payload.question_id:
+                item["scored_marks"] = payload.score
+                if payload.note:
+                    item["override_note"] = payload.note
+                break
+
+        updated = await db.update_submission(submission_id, {
+            "submission_data": _json.dumps(sub_data)
+        })
+        if not updated:
+            raise HTTPException(status_code=500, detail="Failed to update submission")
+
+        return _serialize_submission(updated)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error overriding submission {submission_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+def _serialize_submission(s: dict) -> dict:
+    """Serialize a submission DB row to a JSON-safe dict"""
+    return {
+        "id": str(s.get("id", "")),
+        "paper_id": str(s.get("paper_id", "")),
+        "student_id": str(s.get("student_id", "")) if s.get("student_id") else None,
+        "total_score": s.get("total_score", 0),
+        "max_score": s.get("max_score") or s.get("max_marks") or 0,
+        "grade_percentage": s.get("grade_percentage", 0),
+        "grading_mode": s.get("grading_mode", "auto"),
+        "status": s.get("grading_status") or s.get("status") or "graded",
+        "feedback": s.get("feedback", ""),
+        "submitted_at": str(s.get("created_at", "")),
+        "graded_at": str(s.get("updated_at", "")) if s.get("updated_at") else None,
+    }
 

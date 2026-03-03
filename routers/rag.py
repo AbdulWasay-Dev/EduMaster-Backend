@@ -18,21 +18,38 @@ router = APIRouter()
 # Pydantic models
 class RAGQueryRequest(BaseModel):
     """Request model for RAG queries"""
-    subject_id: str = Field(..., description="Subject ID to search in")
+    subject_id: Optional[str] = Field(None, description="Subject ID to search in")
     document_ids: Optional[List[str]] = Field(None, description="Specific document IDs to search")
-    question: str = Field(..., min_length=1, max_length=1000, description="Question to ask")
+    # Accept both 'question' (backend) and 'query' (frontend) field names
+    question: Optional[str] = Field(None, min_length=1, max_length=1000, description="Question to ask")
+    query: Optional[str] = Field(None, min_length=1, max_length=1000, description="Query (alias for question)")
     question_type: str = Field(default="general", description="Type of question")
     difficulty: str = Field(default="medium", description="Difficulty level")
     include_sources: bool = Field(default=True, description="Include source citations")
+    top_k: Optional[int] = Field(None, description="Number of results to retrieve")
+
+    @property
+    def effective_question(self) -> str:
+        return self.question or self.query or ""
+
+
+class RAGSource(BaseModel):
+    """Source reference model"""
+    document_id: str = ""
+    document_name: str = ""
+    document_title: Optional[str] = None
+    chunk_text: str = ""
+    relevance_score: float = 0.0
+    page_number: Optional[int] = None
 
 
 class RAGQueryResponse(BaseModel):
     """Response model for RAG queries"""
     answer: str
-    sources: List[str]
-    confidence: float
-    question: str
-    subject_id: str
+    sources: List[RAGSource] = []
+    query: str = ""
+    confidence: float = 0.0
+    subject_id: str = ""
 
 
 class QuestionGenerationRequest(BaseModel):
@@ -42,7 +59,7 @@ class QuestionGenerationRequest(BaseModel):
     question_count: int = Field(default=5, ge=1, le=20, description="Number of questions to generate")
     question_types: List[str] = Field(default=["mcq", "short_answer"], description="Types of questions")
     difficulty_level: str = Field(default="medium", description="Difficulty level")
-    title: str = Field(..., description="Title for the generated paper")
+    title: Optional[str] = Field(default=None, description="Title for the generated paper")
 
 
 class QuestionGenerationResponse(BaseModel):
@@ -62,25 +79,34 @@ async def query_rag(
     Query the RAG system with a question
     """
     try:
-        logger.info(f"RAG query from teacher {current_teacher['id']}: {request.question[:50]}...")
+        effective_question = request.effective_question
+        if not effective_question:
+            raise HTTPException(status_code=422, detail="Either 'question' or 'query' field is required")
+
+        logger.info(f"RAG query from teacher {current_teacher['id']}: {effective_question[:50]}...")
         
         # Get services
         db = await get_database()
         embedding_service = get_embedding_service()
         llm_service = get_llm_service()
         
-        # Verify teacher has access to the subject
+        # Determine subject scope
         subjects = await db.get_subjects(current_teacher["id"])
         subject_ids = [str(s["id"]) for s in subjects]
-        
-        if request.subject_id not in subject_ids:
-            raise HTTPException(
-                status_code=403,
-                detail="Access denied to this subject"
-            )
+
+        if request.subject_id:
+            if request.subject_id not in subject_ids:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied to this subject"
+                )
+            search_subject_id = request.subject_id
+        else:
+            # No subject_id provided — use the first available subject, or skip subject filter
+            search_subject_id = subject_ids[0] if subject_ids else None
         
         # Generate query embedding
-        query_embedding = await embedding_service.generate_query_embedding(request.question)
+        query_embedding = await embedding_service.generate_query_embedding(effective_question)
         if not query_embedding:
             raise HTTPException(
                 status_code=500,
@@ -90,8 +116,8 @@ async def query_rag(
         # Search for similar chunks
         similar_chunks = await db.search_similar_chunks(
             embedding=query_embedding,
-            subject_id=request.subject_id,
-            limit=10,
+            subject_id=search_subject_id,
+            limit=request.top_k or 10,
             match_threshold=0.55
         )
         
@@ -100,8 +126,8 @@ async def query_rag(
                 answer="I couldn't find relevant information in the provided documents to answer your question. Please make sure the documents contain information about this topic.",
                 sources=[],
                 confidence=0.0,
-                question=request.question,
-                subject_id=request.subject_id
+                query=effective_question,
+                subject_id=search_subject_id or ""
             )
         
         # Extract context from chunks
@@ -110,7 +136,7 @@ async def query_rag(
         
         # Generate answer using LLM
         answer_result = await llm_service.generate_answer(
-            question=request.question,
+            question=effective_question,
             context=context,
             question_type=request.question_type
         )
@@ -122,16 +148,26 @@ async def query_rag(
             )
         
         # Prepare sources if requested
-        sources = []
+        rag_sources: List[RAGSource] = []
         if request.include_sources:
-            sources = answer_result.get("sources", [])
+            raw_sources = answer_result.get("sources", [])
+            for src in raw_sources:
+                if isinstance(src, dict):
+                    rag_sources.append(RAGSource(
+                        document_id=str(src.get("document_id", "")),
+                        document_name=src.get("document_name", ""),
+                        chunk_text=src.get("chunk_text", src.get("text", "")),
+                        relevance_score=float(src.get("relevance_score", src.get("similarity", 0.0))),
+                    ))
+                elif isinstance(src, str):
+                    rag_sources.append(RAGSource(chunk_text=src))
         
         return RAGQueryResponse(
             answer=answer_result["answer"],
-            sources=sources,
+            sources=rag_sources,
             confidence=answer_result.get("confidence", 0.0),
-            question=request.question,
-            subject_id=request.subject_id
+            query=effective_question,
+            subject_id=search_subject_id or ""
         )
         
     except HTTPException:
@@ -239,7 +275,7 @@ async def generate_questions(
         
         return QuestionGenerationResponse(
             questions=questions,
-            title=request.title,
+            title=request.title or f"Questions for {request.subject_id}",
             subject_id=request.subject_id,
             total_questions=len(questions)
         )

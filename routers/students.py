@@ -33,13 +33,15 @@ class StudentUpdate(BaseModel):
 class StudentResponse(BaseModel):
     """Student response model"""
     id: str
-    student_name: str
+    name: str = ""  # Frontend primary field
+    student_name: str = ""
     student_id: Optional[str] = None
+    roll_number: Optional[str] = None  # alias for student_id
     email: Optional[str] = None
     phone: Optional[str] = None
     class_id: str
     created_at: str
-    updated_at: str
+    updated_at: str = ""
 
 
 class StudentEnrollment(BaseModel):
@@ -83,19 +85,67 @@ async def create_student(
         
         return StudentResponse(
             id=str(created["id"]),
+            name=created["student_name"],
             student_name=created["student_name"],
             student_id=created.get("student_id"),
+            roll_number=created.get("student_id"),
             email=created.get("email"),
             phone=created.get("phone"),
             class_id=str(created["class_id"]),
             created_at=str(created["created_at"]),
-            updated_at=str(created["updated_at"])
+            updated_at=str(created.get("updated_at", created["created_at"]))
         )
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error creating student: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/")
+async def list_students(
+    class_id: Optional[str] = None,
+    current_user: dict = Depends(require_teacher())
+):
+    """List students, optionally filtered by class_id query parameter"""
+    try:
+        db = await get_database()
+
+        if class_id:
+            # Verify access to the class
+            classes = await db.get_classes(current_user["id"])
+            class_ids = [str(c["id"]) for c in classes]
+            if class_id not in class_ids:
+                raise HTTPException(status_code=403, detail="Access denied to this class")
+            students = await db.get_students(class_id)
+        else:
+            # Return all students across all teacher's classes
+            classes = await db.get_classes(current_user["id"])
+            students = []
+            for cls in classes:
+                cls_students = await db.get_students(str(cls["id"]))
+                students.extend(cls_students)
+
+        return [
+            StudentResponse(
+                id=str(s["id"]),
+                name=s["student_name"],
+                student_name=s["student_name"],
+                student_id=s.get("student_id"),
+                roll_number=s.get("student_id"),
+                email=s.get("email"),
+                phone=s.get("phone"),
+                class_id=str(s["class_id"]),
+                created_at=str(s["created_at"]),
+                updated_at=str(s.get("updated_at", s["created_at"]))
+            )
+            for s in students
+        ]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing students: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -123,13 +173,15 @@ async def get_students_by_class(
         return [
             StudentResponse(
                 id=str(student["id"]),
+                name=student["student_name"],
                 student_name=student["student_name"],
                 student_id=student.get("student_id"),
+                roll_number=student.get("student_id"),
                 email=student.get("email"),
                 phone=student.get("phone"),
                 class_id=str(student["class_id"]),
                 created_at=str(student["created_at"]),
-                updated_at=str(student["updated_at"])
+                updated_at=str(student.get("updated_at", student["created_at"]))
             )
             for student in students
         ]
@@ -166,13 +218,15 @@ async def get_student(
         
         return StudentResponse(
             id=str(student["id"]),
+            name=student["student_name"],
             student_name=student["student_name"],
             student_id=student.get("student_id"),
+            roll_number=student.get("student_id"),
             email=student.get("email"),
             phone=student.get("phone"),
             class_id=str(student["class_id"]),
             created_at=str(student["created_at"]),
-            updated_at=str(student["updated_at"])
+            updated_at=str(student.get("updated_at", student["created_at"]))
         )
         
     except HTTPException:
@@ -228,13 +282,15 @@ async def update_student(
         
         return StudentResponse(
             id=str(updated["id"]),
+            name=updated["student_name"],
             student_name=updated["student_name"],
             student_id=updated.get("student_id"),
+            roll_number=updated.get("student_id"),
             email=updated.get("email"),
             phone=updated.get("phone"),
             class_id=str(updated["class_id"]),
             created_at=str(updated["created_at"]),
-            updated_at=str(updated["updated_at"])
+            updated_at=str(updated.get("updated_at", updated["created_at"]))
         )
         
     except HTTPException:

@@ -3,7 +3,7 @@ Paper Management API endpoints
 """
 import logging
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Dict
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from pydantic import BaseModel, Field
 
@@ -35,6 +35,16 @@ class PaperGenerationRequest(BaseModel):
     document_ids: Optional[List[str]] = Field(None, description="Specific document IDs to generate questions from")
     content_filter: Optional[str] = Field(None, description="Text filter to focus on specific topics or chapters")
 
+    # Advanced paper configuration
+    question_type_counts: Optional[Dict[str, int]] = Field(None, description="Per-type question counts e.g. {'mcq': 5, 'short_answer': 3, 'essay': 2}")
+    template: str = Field(default="classic", description="Paper template: classic, university, school, minimalist")
+    institution_name: Optional[str] = Field(None, description="Institution / school name for the paper header")
+    course_name: Optional[str] = Field(None, description="Course name displayed on the paper")
+    exam_date: Optional[str] = Field(None, description="Exam date displayed on the paper")
+    duration: Optional[str] = Field(None, description="Duration string e.g. '3 Hours'")
+    instructions: Optional[str] = Field(None, description="Custom paper instructions")
+    student_fields: Optional[List[str]] = Field(default=["name", "roll_number"], description="Student detail fields to show on paper")
+
 
 class PaperFromSheetRequest(BaseModel):
     """Create paper from question sheet request"""
@@ -57,6 +67,16 @@ class PaperResponse(BaseModel):
     total_marks: float
     is_published: bool
     created_at: str
+    # Extended fields
+    duration_minutes: Optional[int] = None
+    difficulty_level: str = "medium"
+    template: str = "classic"
+    institution_name: Optional[str] = None
+    course_name: Optional[str] = None
+    exam_date: Optional[str] = None
+    duration: Optional[str] = None
+    instructions: Optional[str] = None
+    student_fields: Optional[List[str]] = None
 
 
 @router.post("/generate", response_model=PaperResponse)
@@ -77,14 +97,14 @@ async def generate_paper(
         
         # Verify teacher has access to the subject
         subjects = await db.get_subjects(current_teacher["id"])
-        subject_ids = [s["id"] for s in subjects]
-        
+        subject_ids = [str(s["id"]) for s in subjects]
+
         if request.subject_id not in subject_ids:
             raise HTTPException(
                 status_code=403,
                 detail="Access denied to this subject"
             )
-        
+
         # Get documents for the subject
         documents = await db.get_documents(request.subject_id)
         
@@ -203,13 +223,22 @@ async def generate_paper(
         from routers.rag import organize_content_for_questions
         organized_content = await organize_content_for_questions(relevant_chunks, request.question_count)
         
+        # Resolve question count and types from question_type_counts if provided
+        if request.question_type_counts:
+            resolved_types = list(request.question_type_counts.keys())
+            resolved_count = sum(request.question_type_counts.values())
+        else:
+            resolved_types = request.question_types
+            resolved_count = request.question_count
+
         # Generate questions using RAG content
         questions = await llm_service.generate_questions_from_rag_content(
             organized_content=organized_content,
-            question_count=request.question_count,
-            question_types=request.question_types,
+            question_count=resolved_count,
+            question_types=resolved_types,
             difficulty_level=request.difficulty_level,
-            subject_id=request.subject_id
+            subject_id=request.subject_id,
+            question_type_counts=request.question_type_counts
         )
         
         if not questions:
@@ -219,16 +248,28 @@ async def generate_paper(
             )
         
         # Sort questions by type for proper ordering (MCQs first, then short answer, etc.)
-        questions = _sort_questions_by_type(questions, request.question_types)
-        
+        questions = _sort_questions_by_type(questions, resolved_types)
+
+        # Normalize field names: add 'marks' alias and 'difficulty' string
+        _diff_map = {1: 'easy', 2: 'easy', 3: 'medium', 4: 'hard', 5: 'hard'}
+        for q in questions:
+            if 'marks' not in q:
+                q['marks'] = q.get('max_score', 5)
+            if 'difficulty' not in q:
+                raw_dl = q.get('difficulty_level', 3)
+                try:
+                    q['difficulty'] = _diff_map.get(int(raw_dl), 'medium')
+                except (TypeError, ValueError):
+                    q['difficulty'] = str(raw_dl) if raw_dl else 'medium'
+
         # Create answer key using the sorted question IDs
         answer_key = {}
         total_marks = 0
-        
+
         for question in questions:
             question_id = question.get("id", f"q{question.get('question_number', 1)}")
             answer_key[question_id] = question.get("correct_answer", "")
-            total_marks += question.get("max_score", 5)
+            total_marks += question.get("marks", question.get("max_score", 5))
         
         # Create paper record
         paper_data = {
@@ -242,9 +283,17 @@ async def generate_paper(
             "answer_key": answer_key,
             "total_marks": total_marks,
             "configuration": {
-                "question_types": request.question_types,
+                "question_types": resolved_types,
                 "difficulty_level": request.difficulty_level,
-                "time_limit": request.time_limit
+                "time_limit": request.time_limit,
+                "template": request.template,
+                "institution_name": request.institution_name,
+                "course_name": request.course_name,
+                "exam_date": request.exam_date,
+                "duration": request.duration,
+                "instructions": request.instructions,
+                "student_fields": request.student_fields or ["name", "roll_number"],
+                "question_type_counts": request.question_type_counts,
             },
             "is_published": False
         }
@@ -256,19 +305,31 @@ async def generate_paper(
                 detail="Failed to create paper"
             )
         
+        _cfg = paper.get("configuration") or {}
+        if isinstance(_cfg, str):
+            import json as _json
+            _cfg = _json.loads(_cfg)
         return PaperResponse(
-            id=paper["id"],
+            id=str(paper["id"]),
             title=paper["title"],
-            description=paper["description"],
-            subject_id=paper["subject_id"],
-            class_id=paper.get("class_id"),
-            questions=paper["questions"],
-            answer_key=paper["answer_key"],
-            total_marks=paper["total_marks"],
-            is_published=paper["is_published"],
-            created_at=paper["created_at"]
+            description=paper.get("description") or "",
+            subject_id=str(paper["subject_id"]),
+            class_id=str(paper["class_id"]) if paper.get("class_id") else None,
+            questions=paper.get("questions") or [],
+            answer_key=paper.get("answer_key") or {},
+            total_marks=paper.get("total_marks") or 0,
+            is_published=paper.get("is_published", False),
+            created_at=str(paper["created_at"]),
+            difficulty_level=_cfg.get("difficulty_level", request.difficulty_level),
+            template=_cfg.get("template", request.template),
+            institution_name=_cfg.get("institution_name", request.institution_name),
+            course_name=_cfg.get("course_name", request.course_name),
+            exam_date=_cfg.get("exam_date", request.exam_date),
+            duration=_cfg.get("duration", request.duration),
+            instructions=_cfg.get("instructions", request.instructions),
+            student_fields=_cfg.get("student_fields", request.student_fields),
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -297,14 +358,14 @@ async def create_paper_from_question_sheet(
         
         # Verify teacher has access to the subject
         subjects = await db.get_subjects(current_teacher["id"])
-        subject_ids = [s["id"] for s in subjects]
-        
+        subject_ids = [str(s["id"]) for s in subjects]
+
         if request.subject_id not in subject_ids:
             raise HTTPException(
                 status_code=403,
                 detail="Access denied to this subject"
             )
-        
+
         # Decode and process the question sheet image
         import base64
         import io
@@ -466,18 +527,7 @@ async def preview_paper(
                 detail="Access denied to this paper"
             )
         
-        return PaperResponse(
-            id=paper["id"],
-            title=paper["title"],
-            description=paper["description"],
-            subject_id=paper["subject_id"],
-            class_id=paper.get("class_id"),
-            questions=paper["questions"],
-            answer_key=paper["answer_key"],
-            total_marks=paper["total_marks"],
-            is_published=paper["is_published"],
-            created_at=paper["created_at"]
-        )
+        return PaperResponse(**_serialize_paper(paper))
         
     except HTTPException:
         raise
@@ -527,11 +577,18 @@ async def publish_paper(
                 detail="Failed to publish paper"
             )
         
-        return {
-            "message": "Paper published successfully",
-            "paper_id": paper_id,
-            "published_at": updated_paper["published_at"]
-        }
+        return PaperResponse(
+            id=str(updated_paper["id"]),
+            title=updated_paper["title"],
+            description=updated_paper.get("description") or "",
+            subject_id=str(updated_paper["subject_id"]),
+            class_id=str(updated_paper["class_id"]) if updated_paper.get("class_id") else None,
+            questions=updated_paper.get("questions") or [],
+            answer_key=updated_paper.get("answer_key") or {},
+            total_marks=updated_paper.get("total_marks") or 0,
+            is_published=updated_paper.get("is_published", False),
+            created_at=str(updated_paper["created_at"]),
+        )
         
     except HTTPException:
         raise
@@ -547,280 +604,104 @@ async def publish_paper(
 async def export_paper(
     paper_id: str,
     format: str = "pdf",
+    template_name: Optional[str] = Query(default=None, alias="template"),
     current_teacher: dict = Depends(require_teacher_or_admin())
 ):
     """
-    Export paper in printable format (PDF, HTML, or plain text)
+    Export paper in printable format (PDF, HTML, or plain text).
+    Supports 4 PDF templates: classic, university, school, minimalist.
     """
     try:
         db = await get_database()
-        
+
         # Get paper details
         paper = await db.get_paper(paper_id)
         if not paper:
-            raise HTTPException(
-                status_code=404,
-                detail="Paper not found"
-            )
-        
+            raise HTTPException(status_code=404, detail="Paper not found")
+
         # Verify teacher has access
-        if paper["owner_id"] != current_teacher["id"]:
-            raise HTTPException(
-                status_code=403,
-                detail="Access denied to this paper"
-            )
-        
-        # Generate printable content
-        printable_content = _generate_printable_content(paper)
-        
-        if format.lower() == "pdf":
-            # Generate actual PDF binary
+        if str(paper["owner_id"]) != str(current_teacher["id"]):
+            raise HTTPException(status_code=403, detail="Access denied to this paper")
+
+        # Extract metadata from configuration
+        _cfg = paper.get("configuration") or {}
+        if isinstance(_cfg, str):
+            import json as _j2
             try:
-                from reportlab.lib.pagesizes import letter, A4
-                from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
-                from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-                from reportlab.lib.units import inch
-                from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-                from reportlab.lib import colors
-                import io
-                
-                # Get paper details with subject and class info
-                db = await get_database()
+                _cfg = _j2.loads(_cfg)
+            except Exception:
+                _cfg = {}
+
+        paper_meta = {
+            "institution_name": _cfg.get("institution_name", "EduMaster Institute"),
+            "course_name": _cfg.get("course_name", ""),
+            "exam_date": _cfg.get("exam_date", "________________"),
+            "duration": _cfg.get("duration", "3 Hours"),
+            "instructions": _cfg.get("instructions", ""),
+            "student_fields": _cfg.get("student_fields", ["name", "roll_number"]),
+        }
+        # Template: query param overrides stored config
+        resolved_template = template_name or _cfg.get("template", "classic")
+
+        # Generate printable content (text fallback)
+        printable_content = _generate_printable_content(paper)
+
+        if format.lower() == "pdf":
+            try:
+                # Get extra context
                 subject_info = await db.get_subject(str(paper['subject_id']))
                 class_info = None
                 if subject_info and subject_info.get('class_id'):
                     class_info = await db.get_class(str(subject_info['class_id']))
-                
                 teacher_info = await db.get_teacher(str(paper['owner_id']))
-                teacher_name = "Unknown Teacher"
-                if teacher_info:
-                    teacher_name = teacher_info.get('name', 'Unknown Teacher')
-                
-                # Create PDF buffer
-                buffer = io.BytesIO()
-                doc = SimpleDocTemplate(buffer, pagesize=A4, 
-                                      rightMargin=50, leftMargin=50, 
-                                      topMargin=50, bottomMargin=50)
-                
-                # Get styles
-                styles = getSampleStyleSheet()
-                
-                # Custom styles for institute paper
-                institute_style = ParagraphStyle(
-                    'Institute',
-                    parent=styles['Heading1'],
-                    fontSize=16,
-                    spaceAfter=5,
-                    alignment=TA_CENTER,
-                    textColor=colors.black
+                teacher_name = teacher_info.get('name', 'Unknown Teacher') if teacher_info else 'Unknown Teacher'
+                subject_name = subject_info.get('name', 'Unknown Subject') if subject_info else 'Unknown Subject'
+                class_name = class_info.get('name', '') if class_info else ''
+
+                pdf_bytes = _build_paper_pdf(
+                    paper=paper,
+                    meta=paper_meta,
+                    template=resolved_template,
+                    subject_name=subject_name,
+                    class_name=class_name,
+                    teacher_name=teacher_name,
                 )
-                
-                title_style = ParagraphStyle(
-                    'PaperTitle',
-                    parent=styles['Heading2'],
-                    fontSize=14,
-                    spaceAfter=20,
-                    alignment=TA_CENTER,
-                    textColor=colors.black
-                )
-                
-                info_style = ParagraphStyle(
-                    'Info',
-                    parent=styles['Normal'],
-                    fontSize=10,
-                    spaceAfter=5,
-                    alignment=TA_LEFT
-                )
-                
-                section_style = ParagraphStyle(
-                    'Section',
-                    parent=styles['Heading3'],
-                    fontSize=12,
-                    spaceAfter=10,
-                    spaceBefore=15,
-                    alignment=TA_LEFT,
-                    textColor=colors.black
-                )
-                
-                question_style = ParagraphStyle(
-                    'Question',
-                    parent=styles['Normal'],
-                    fontSize=11,
-                    spaceAfter=8,
-                    leftIndent=0
-                )
-                
-                option_style = ParagraphStyle(
-                    'Option',
-                    parent=styles['Normal'],
-                    fontSize=10,
-                    spaceAfter=4,
-                    leftIndent=25
-                )
-                
-                # Build PDF content
-                story = []
-                
-                # Institute Header
-                story.append(Paragraph("EDUMASTER INSTITUTE", institute_style))
-                story.append(Paragraph("EXAMINATION DEPARTMENT", styles['Normal']))
-                story.append(Spacer(1, 20))
-                
-                # Paper details table
-                paper_info = [
-                    ['Subject:', subject_info.get('name', 'Unknown Subject') if subject_info else 'Unknown Subject'],
-                    ['Class:', class_info.get('name', 'Unknown Class') if class_info else 'Unknown Class'],
-                    ['Teacher:', teacher_name],
-                    ['Total Marks:', str(paper.get('total_marks', 0))],
-                    ['Time:', '3 Hours'],
-                    ['Date:', '_____________']
-                ]
-                
-                info_table = Table(paper_info, colWidths=[1.5*inch, 3*inch])
-                info_table.setStyle(TableStyle([
-                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, -1), 10),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-                ]))
-                story.append(info_table)
-                story.append(Spacer(1, 20))
-                
-                # Paper title
-                story.append(Paragraph(paper['title'], title_style))
-                story.append(Spacer(1, 10))
-                
-                # Instructions
-                instructions = [
-                    "Instructions:",
-                    "1. Answer ALL questions",
-                    "2. Write clearly and legibly",
-                    "3. Marks are indicated against each question"
-                ]
-                for instruction in instructions:
-                    style = styles['Normal'] if instruction != "Instructions:" else ParagraphStyle('Bold', parent=styles['Normal'], fontName='Helvetica-Bold')
-                    story.append(Paragraph(instruction, style))
-                story.append(Spacer(1, 20))
-                
-                # Organize questions by type
-                questions = paper.get('questions', [])
-                mcq_questions = [q for q in questions if q.get('question_type') == 'mcq']
-                short_questions = [q for q in questions if q.get('question_type') == 'short_answer']
-                long_questions = [q for q in questions if q.get('question_type') in ['essay', 'long_answer']]
-                other_questions = [q for q in questions if q.get('question_type') not in ['mcq', 'short_answer', 'essay', 'long_answer']]
-                
-                question_num = 1
-                
-                # MCQ Section
-                if mcq_questions:
-                    story.append(Paragraph("SECTION A: MULTIPLE CHOICE QUESTIONS", section_style))
-                    story.append(Paragraph("Choose the correct answer:", styles['Normal']))
-                    story.append(Spacer(1, 10))
-                    
-                    for question in mcq_questions:
-                        marks = question.get('max_score', 1)
-                        q_text = f"{question_num}. {question.get('question_text', 'No question text')} ({marks} mark{'s' if marks != 1 else ''})"
-                        story.append(Paragraph(q_text, question_style))
-                        
-                        # Options for MCQ - fix duplicate letters
-                        if question.get('options'):
-                            for j, option in enumerate(question['options']):
-                                letter = chr(65 + j)  # A, B, C, D
-                                # Clean the option text to remove any existing letter prefixes
-                                clean_option = option.strip()
-                                if clean_option.startswith(('A)', 'B)', 'C)', 'D)', 'a)', 'b)', 'c)', 'd)')):
-                                    clean_option = clean_option[2:].strip()
-                                story.append(Paragraph(f"{letter}) {clean_option}", option_style))
-                        
-                        story.append(Spacer(1, 12))
-                        question_num += 1
-                
-                # Short Answer Section
-                if short_questions:
-                    story.append(Paragraph("SECTION B: SHORT ANSWER QUESTIONS", section_style))
-                    story.append(Spacer(1, 10))
-                    
-                    for question in short_questions:
-                        marks = question.get('max_score', 5)
-                        q_text = f"{question_num}. {question.get('question_text', 'No question text')} ({marks} marks)"
-                        story.append(Paragraph(q_text, question_style))
-                        story.append(Spacer(1, 40))  # Space for answer
-                        question_num += 1
-                
-                # Long Answer Section
-                if long_questions:
-                    story.append(Paragraph("SECTION C: LONG ANSWER QUESTIONS", section_style))
-                    story.append(Spacer(1, 10))
-                    
-                    for question in long_questions:
-                        marks = question.get('max_score', 10)
-                        q_text = f"{question_num}. {question.get('question_text', 'No question text')} ({marks} marks)"
-                        story.append(Paragraph(q_text, question_style))
-                        story.append(Spacer(1, 60))  # More space for long answers
-                        question_num += 1
-                
-                # Other questions
-                if other_questions:
-                    story.append(Paragraph("SECTION D: OTHER QUESTIONS", section_style))
-                    story.append(Spacer(1, 10))
-                    
-                    for question in other_questions:
-                        marks = question.get('max_score', 5)
-                        q_text = f"{question_num}. {question.get('question_text', 'No question text')} ({marks} marks)"
-                        story.append(Paragraph(q_text, question_style))
-                        story.append(Spacer(1, 40))
-                        question_num += 1
-                
-                # Build PDF (without answer key)
-                doc.build(story)
-                
-                # Get PDF bytes
-                pdf_bytes = buffer.getvalue()
-                buffer.close()
-                
+
                 from fastapi.responses import Response
+                safe_title = paper['title'].replace(' ', '_').replace('/', '-')
                 return Response(
                     content=pdf_bytes,
                     media_type="application/pdf",
-                    headers={"Content-Disposition": f"attachment; filename={paper['title'].replace(' ', '_')}.pdf"}
+                    headers={"Content-Disposition": f"attachment; filename={safe_title}.pdf"}
                 )
-                
             except ImportError:
-                # Fallback if reportlab is not installed
                 logger.warning("ReportLab not installed, falling back to HTML")
                 from fastapi.responses import HTMLResponse
                 html_content = _generate_html_paper(paper, printable_content)
                 return HTMLResponse(content=html_content, media_type="text/html")
             except Exception as e:
                 logger.error(f"Error generating PDF: {e}")
-                # Fallback to HTML
                 from fastapi.responses import HTMLResponse
                 html_content = _generate_html_paper(paper, printable_content)
                 return HTMLResponse(content=html_content, media_type="text/html")
-        
+
         elif format.lower() == "html":
             from fastapi.responses import HTMLResponse
             html_content = _generate_html_paper(paper, printable_content)
             return HTMLResponse(content=html_content, media_type="text/html")
-        
+
         elif format.lower() == "txt":
             from fastapi.responses import PlainTextResponse
             return PlainTextResponse(content=printable_content, media_type="text/plain")
-        
+
         else:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported format. Use 'pdf', 'html', or 'txt'"
-            )
-        
+            raise HTTPException(status_code=400, detail="Unsupported format. Use 'pdf', 'html', or 'txt'")
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error exporting paper: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error"
-        )
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/{paper_id}/printable")
@@ -1380,15 +1261,15 @@ async def list_papers(
         # Get papers for teacher
         papers = await db.get_papers(current_teacher["id"])
         
-        # Filter by subject or class if specified
+        # Filter by subject or class if specified (compare as strings to handle UUID objects)
         if subject_id:
-            papers = [p for p in papers if p["subject_id"] == subject_id]
+            papers = [p for p in papers if str(p.get("subject_id", "")) == subject_id]
         
         if class_id:
-            papers = [p for p in papers if p.get("class_id") == class_id]
+            papers = [p for p in papers if str(p.get("class_id", "")) == class_id]
         
         return {
-            "papers": papers,
+            "papers": [_serialize_paper(p) for p in papers],
             "total": len(papers)
         }
         
@@ -1398,6 +1279,416 @@ async def list_papers(
             status_code=500,
             detail="Internal server error"
         )
+
+
+@router.get("/{paper_id}", response_model=PaperResponse)
+async def get_paper(
+    paper_id: str,
+    current_teacher: dict = Depends(require_teacher_or_admin())
+):
+    """Get paper by ID"""
+    try:
+        db = await get_database()
+        paper = await db.get_paper(paper_id)
+        if not paper:
+            raise HTTPException(status_code=404, detail="Paper not found")
+        if str(paper["owner_id"]) != str(current_teacher["id"]):
+            raise HTTPException(status_code=403, detail="Access denied to this paper")
+        return PaperResponse(**_serialize_paper(paper))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting paper {paper_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.put("/{paper_id}", response_model=PaperResponse)
+async def update_paper_endpoint(
+    paper_id: str,
+    payload: dict,
+    current_teacher: dict = Depends(require_teacher_or_admin())
+):
+    """Update paper fields (title, questions, metadata, template, etc.)"""
+    try:
+        db = await get_database()
+        paper = await db.get_paper(paper_id)
+        if not paper:
+            raise HTTPException(status_code=404, detail="Paper not found")
+        if str(paper["owner_id"]) != str(current_teacher["id"]):
+            raise HTTPException(status_code=403, detail="Access denied to this paper")
+
+        # Fields that map directly to DB columns
+        allowed_direct = {"title", "description", "questions", "answer_key", "total_marks",
+                          "difficulty_level", "time_limit", "is_published", "class_id"}
+        # Fields that live inside the `configuration` JSONB column
+        meta_fields = {"template", "institution_name", "course_name", "exam_date",
+                       "duration", "instructions", "student_fields"}
+
+        update_data: dict = {k: v for k, v in payload.items() if k in allowed_direct}
+
+        # Merge metadata into configuration
+        if any(k in payload for k in meta_fields):
+            existing_cfg = paper.get("configuration") or {}
+            if isinstance(existing_cfg, str):
+                import json as _jj
+                try:
+                    existing_cfg = _jj.loads(existing_cfg)
+                except Exception:
+                    existing_cfg = {}
+            for k in meta_fields:
+                if k in payload:
+                    existing_cfg[k] = payload[k]
+            update_data["configuration"] = existing_cfg
+
+        updated = await db.update_paper(paper_id, update_data)
+        if not updated:
+            raise HTTPException(status_code=500, detail="Failed to update paper")
+
+        return PaperResponse(**_serialize_paper(updated))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating paper {paper_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.delete("/{paper_id}")
+async def delete_paper(
+    paper_id: str,
+    current_teacher: dict = Depends(require_teacher_or_admin())
+):
+    """Delete a paper"""
+    try:
+        db = await get_database()
+        paper = await db.get_paper(paper_id)
+        if not paper:
+            raise HTTPException(status_code=404, detail="Paper not found")
+        if str(paper["owner_id"]) != str(current_teacher["id"]):
+            raise HTTPException(status_code=403, detail="Access denied to this paper")
+
+        import uuid as _uuid
+        async with db.connection() as conn:
+            await conn.execute("DELETE FROM papers WHERE id = $1", _uuid.UUID(paper_id))
+        return {"deleted": True, "paper_id": paper_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting paper {paper_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+def _serialize_paper(paper: dict) -> dict:
+    """Serialize a paper DB row to a JSON-safe dict"""
+    cfg = paper.get("configuration") or {}
+    if isinstance(cfg, str):
+        import json as _j
+        try:
+            cfg = _j.loads(cfg)
+        except Exception:
+            cfg = {}
+    return {
+        "id": str(paper["id"]),
+        "title": paper.get("title", ""),
+        "description": paper.get("description") or "",
+        "subject_id": str(paper["subject_id"]),
+        "class_id": str(paper["class_id"]) if paper.get("class_id") else None,
+        "questions": paper.get("questions") or [],
+        "answer_key": paper.get("answer_key") or {},
+        "total_marks": paper.get("total_marks") or 0,
+        "is_published": paper.get("is_published", False),
+        "difficulty_level": cfg.get("difficulty_level", "medium"),
+        "template": cfg.get("template", "classic"),
+        "institution_name": cfg.get("institution_name"),
+        "course_name": cfg.get("course_name"),
+        "exam_date": cfg.get("exam_date"),
+        "duration": cfg.get("duration"),
+        "instructions": cfg.get("instructions"),
+        "student_fields": cfg.get("student_fields", ["name", "roll_number"]),
+        "teacher_id": str(paper["owner_id"]) if paper.get("owner_id") else None,
+        "created_at": str(paper["created_at"]),
+    }
+
+
+def _build_paper_pdf(
+    paper: dict,
+    meta: dict,
+    template: str,
+    subject_name: str = "",
+    class_name: str = "",
+    teacher_name: str = "",
+) -> bytes:
+    """Build a PDF for the paper using the specified template. Returns raw bytes."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch, cm
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT, TA_JUSTIFY
+    from reportlab.lib import colors
+    import io
+
+    buffer = io.BytesIO()
+    styles = getSampleStyleSheet()
+
+    questions = paper.get("questions", [])
+    title = paper.get("title", "Examination Paper")
+    total_marks = paper.get("total_marks", 0)
+    institution = meta.get("institution_name") or "EduMaster Institute"
+    course = meta.get("course_name") or subject_name
+    exam_date = meta.get("exam_date") or "________________"
+    duration = meta.get("duration") or "3 Hours"
+    custom_instructions = meta.get("instructions") or ""
+    student_fields = meta.get("student_fields") or ["name", "roll_number"]
+
+    # Shared question section builder
+    def _add_questions(story, section_qs, section_title, blank_space, q_style, opt_style, start_num):
+        if not section_qs:
+            return start_num
+        story.append(Paragraph(section_title, styles["_Section"]))
+        story.append(Spacer(1, 8))
+        n = start_num
+        for q in section_qs:
+            marks = q.get("marks") or q.get("max_score") or 5
+            q_text = f"{n}. {q.get('question_text', '')} <font size='9' color='grey'>({marks} marks)</font>"
+            story.append(Paragraph(q_text, q_style))
+            if q.get("question_type") == "mcq" and q.get("options"):
+                for j, opt in enumerate(q["options"]):
+                    clean = opt.strip()
+                    for prefix in ("A)", "B)", "C)", "D)", "a)", "b)", "c)", "d)"):
+                        if clean.startswith(prefix):
+                            clean = clean[2:].strip()
+                    story.append(Paragraph(f"{chr(65+j)}) {clean}", opt_style))
+            else:
+                story.append(Spacer(1, blank_space))
+            story.append(Spacer(1, 6))
+            n += 1
+        return n
+
+    # ── Student detail box ──────────────────────────────────────────────────
+    FIELD_LABELS = {
+        "name": "Student Name",
+        "roll_number": "Roll No.",
+        "class": "Class",
+        "section": "Section",
+        "signature": "Signature",
+        "father_name": "Father's Name",
+    }
+
+    def _student_box(story, fields):
+        rows = [
+            [FIELD_LABELS.get(f, f.replace("_", " ").title()) + ":", "________________________"]
+            for f in fields
+        ]
+        if not rows:
+            return
+        t = Table(rows, colWidths=[1.6 * inch, 3.2 * inch])
+        t.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        ]))
+        story.append(t)
+        story.append(Spacer(1, 12))
+
+    # ── Template dispatchers ─────────────────────────────────────────────────
+
+    if template == "university":
+        doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=50, leftMargin=50,
+                                topMargin=45, bottomMargin=45)
+        story = []
+        # Top border rule
+        story.append(HRFlowable(width="100%", thickness=2.5, color=colors.HexColor("#1a237e")))
+        story.append(Spacer(1, 6))
+        # Two-column header: logo placeholder | institution
+        hdr = Table(
+            [["[LOGO]", institution.upper()]],
+            colWidths=[1.2 * inch, 5.3 * inch],
+        )
+        hdr.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (0, 0), "Helvetica"),
+            ("FONTSIZE", (0, 0), (0, 0), 9),
+            ("FONTNAME", (1, 0), (1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (1, 0), (1, 0), 17),
+            ("ALIGN", (1, 0), (1, 0), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TEXTCOLOR", (1, 0), (1, 0), colors.HexColor("#1a237e")),
+        ]))
+        story.append(hdr)
+        story.append(Spacer(1, 4))
+        story.append(Paragraph("Examination Department", ParagraphStyle(
+            "SubHdr", parent=styles["Normal"], fontSize=10, alignment=TA_CENTER,
+            textColor=colors.HexColor("#3949AB"))))
+        story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#1a237e")))
+        story.append(Spacer(1, 10))
+        # Info table
+        info = Table([
+            [f"Course: {course}", f"Date: {exam_date}"],
+            [f"Subject: {subject_name}", f"Duration: {duration}"],
+            [f"Total Marks: {total_marks}", f"Teacher: {teacher_name}"],
+        ], colWidths=[3.5 * inch, 3 * inch])
+        info.setStyle(TableStyle([
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(info)
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(title, ParagraphStyle(
+            "PTitle", parent=styles["Heading2"], fontSize=13, alignment=TA_CENTER)))
+        story.append(Spacer(1, 6))
+        _student_box(story, student_fields)
+        if custom_instructions:
+            story.append(Paragraph("<b>Instructions:</b> " + custom_instructions,
+                                   ParagraphStyle("Ins", parent=styles["Normal"], fontSize=9)))
+            story.append(Spacer(1, 8))
+        styles.add(ParagraphStyle("_Section", parent=styles["Heading3"], fontSize=11,
+                                   spaceBefore=12, spaceAfter=6,
+                                   textColor=colors.HexColor("#1a237e"), fontName="Helvetica-Bold"))
+        q_style = ParagraphStyle("QStyle", parent=styles["Normal"], fontSize=10, spaceAfter=4)
+        opt_style = ParagraphStyle("OptStyle", parent=styles["Normal"], fontSize=9, leftIndent=22, spaceAfter=3)
+
+    elif template == "school":
+        doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=45, leftMargin=45,
+                                topMargin=45, bottomMargin=45)
+        story = []
+        # Colorful header band
+        band = Table([[institution.upper()]], colWidths=[6.7 * inch])
+        band.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FF6F00")),
+            ("TEXTCOLOR", (0, 0), (-1, -1), colors.white),
+            ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 16),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        story.append(band)
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(title, ParagraphStyle(
+            "SchTitle", parent=styles["Normal"], fontSize=14,
+            fontName="Helvetica-Bold", alignment=TA_CENTER)))
+        story.append(Spacer(1, 6))
+        info = Table([
+            [f"Subject: {subject_name or course}", f"Class: {class_name}", f"Total Marks: {total_marks}"],
+            [f"Date: {exam_date}", f"Duration: {duration}", f"Teacher: {teacher_name}"],
+        ], colWidths=[2.2 * inch, 2.2 * inch, 2.3 * inch])
+        info.setStyle(TableStyle([
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#FF6F00")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#FFB74D")),
+        ]))
+        story.append(info)
+        story.append(Spacer(1, 10))
+        _student_box(story, student_fields)
+        if custom_instructions:
+            story.append(Paragraph(f"<b>Instructions:</b> {custom_instructions}",
+                                   ParagraphStyle("Ins", parent=styles["Normal"], fontSize=9)))
+            story.append(Spacer(1, 8))
+        styles.add(ParagraphStyle("_Section", parent=styles["Normal"], fontSize=11,
+                                   fontName="Helvetica-Bold", spaceBefore=14, spaceAfter=6,
+                                   textColor=colors.HexColor("#E65100"), backColor=colors.HexColor("#FFF3E0")))
+        q_style = ParagraphStyle("QStyle", parent=styles["Normal"], fontSize=10, spaceAfter=5, leading=14)
+        opt_style = ParagraphStyle("OptStyle", parent=styles["Normal"], fontSize=9, leftIndent=22, spaceAfter=3)
+
+    elif template == "minimalist":
+        doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=60, leftMargin=60,
+                                topMargin=55, bottomMargin=55)
+        story = []
+        story.append(Paragraph(institution, ParagraphStyle(
+            "MIns", parent=styles["Normal"], fontSize=10,
+            textColor=colors.grey, alignment=TA_LEFT)))
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(title, ParagraphStyle(
+            "MTitle", parent=styles["Normal"], fontSize=16,
+            fontName="Helvetica-Bold", spaceAfter=4)))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=colors.grey))
+        story.append(Spacer(1, 6))
+        info = Table([
+            [f"{subject_name or course}", f"{exam_date}", f"{total_marks} marks", f"{duration}"]
+        ], colWidths=[1.8 * inch, 1.6 * inch, 1.5 * inch, 1.5 * inch])
+        info.setStyle(TableStyle([
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("TEXTCOLOR", (0, 0), (-1, -1), colors.grey),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        story.append(info)
+        story.append(Spacer(1, 10))
+        _student_box(story, student_fields)
+        if custom_instructions:
+            story.append(Paragraph(custom_instructions,
+                                   ParagraphStyle("Ins", parent=styles["Normal"], fontSize=8,
+                                                  textColor=colors.grey)))
+            story.append(Spacer(1, 8))
+        styles.add(ParagraphStyle("_Section", parent=styles["Normal"], fontSize=10,
+                                   fontName="Helvetica-Bold", spaceBefore=12, spaceAfter=5,
+                                   textColor=colors.black))
+        q_style = ParagraphStyle("QStyle", parent=styles["Normal"], fontSize=10, spaceAfter=4, leading=13)
+        opt_style = ParagraphStyle("OptStyle", parent=styles["Normal"], fontSize=9, leftIndent=18, spaceAfter=2)
+
+    else:  # classic (default)
+        doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=50, leftMargin=50,
+                                topMargin=50, bottomMargin=50)
+        story = []
+        story.append(Paragraph(institution.upper(), ParagraphStyle(
+            "CIns", parent=styles["Heading1"], fontSize=16, spaceAfter=4, alignment=TA_CENTER)))
+        story.append(Paragraph("EXAMINATION DEPARTMENT", ParagraphStyle(
+            "CDept", parent=styles["Normal"], fontSize=10, alignment=TA_CENTER,
+            textColor=colors.grey)))
+        story.append(Spacer(1, 16))
+        paper_info = [
+            ["Subject:", subject_name or course],
+            ["Class:", class_name],
+            ["Teacher:", teacher_name],
+            ["Total Marks:", str(total_marks)],
+            ["Time:", duration],
+            ["Date:", exam_date],
+        ]
+        it = Table(paper_info, colWidths=[1.5 * inch, 3 * inch])
+        it.setStyle(TableStyle([
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 10),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.append(it)
+        story.append(Spacer(1, 16))
+        story.append(Paragraph(title, ParagraphStyle(
+            "PTitle", parent=styles["Heading2"], fontSize=14, alignment=TA_CENTER)))
+        story.append(Spacer(1, 10))
+        _student_box(story, student_fields)
+        instr_lines = (custom_instructions or "Answer ALL questions. Marks are indicated against each question.").split("\n")
+        story.append(Paragraph("<b>Instructions:</b>", ParagraphStyle(
+            "InsHdr", parent=styles["Normal"], fontSize=10)))
+        for line in instr_lines:
+            if line.strip():
+                story.append(Paragraph(line.strip(), styles["Normal"]))
+        story.append(Spacer(1, 16))
+        styles.add(ParagraphStyle("_Section", parent=styles["Heading3"], fontSize=12,
+                                   spaceBefore=14, spaceAfter=8, textColor=colors.black))
+        q_style = ParagraphStyle("QStyle", parent=styles["Normal"], fontSize=11, spaceAfter=8)
+        opt_style = ParagraphStyle("OptStyle", parent=styles["Normal"], fontSize=10, leftIndent=25, spaceAfter=4)
+
+    # ── Common question sections ────────────────────────────────────────────
+    mcq_qs = [q for q in questions if q.get("question_type") == "mcq"]
+    short_qs = [q for q in questions if q.get("question_type") == "short_answer"]
+    long_qs = [q for q in questions if q.get("question_type") in ("essay", "long_answer")]
+    tf_qs = [q for q in questions if q.get("question_type") == "true_false"]
+    fill_qs = [q for q in questions if q.get("question_type") in ("fill_blank", "fill_in_blank")]
+    other_qs = [q for q in questions if q.get("question_type") not in
+                ("mcq", "short_answer", "essay", "long_answer", "true_false", "fill_blank", "fill_in_blank")]
+
+    n = 1
+    n = _add_questions(story, mcq_qs, "SECTION A: MULTIPLE CHOICE QUESTIONS", 0, q_style, opt_style, n)
+    n = _add_questions(story, short_qs, "SECTION B: SHORT ANSWER QUESTIONS", 38, q_style, opt_style, n)
+    n = _add_questions(story, long_qs, "SECTION C: LONG ANSWER / ESSAY QUESTIONS", 65, q_style, opt_style, n)
+    n = _add_questions(story, tf_qs, "SECTION D: TRUE / FALSE", 20, q_style, opt_style, n)
+    n = _add_questions(story, fill_qs, "SECTION E: FILL IN THE BLANKS", 28, q_style, opt_style, n)
+    n = _add_questions(story, other_qs, "SECTION F: OTHER QUESTIONS", 38, q_style, opt_style, n)
+
+    doc.build(story)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
 
 
 def _sort_questions_by_type(questions: List[dict], question_types: List[str]) -> List[dict]:

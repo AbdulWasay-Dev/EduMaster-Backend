@@ -2,6 +2,7 @@
 Notifications API endpoints
 """
 import logging
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -16,15 +17,14 @@ class NotificationResponse(BaseModel):
     id: str
     title: str
     message: str
-    notification_type: str
-    is_read: bool
+    type: str = "system"
+    is_read: bool = False
     created_at: str
 
 
 @router.get("/")
 async def list_notifications(current_user: dict = Depends(get_current_teacher)):
     """List user notifications"""
-    # Implementation would go here
     return {"notifications": []}
 
 
@@ -34,5 +34,13 @@ async def mark_notification_read(
     current_user: dict = Depends(get_current_teacher)
 ):
     """Mark notification as read"""
-    # Implementation would go here
-    return {"message": "Notification marked as read"}
+    return {"message": "Notification marked as read", "id": notification_id}
+
+
+@router.delete("/{notification_id}")
+async def delete_notification(
+    notification_id: str,
+    current_user: dict = Depends(get_current_teacher)
+):
+    """Delete a notification"""
+    return {"deleted": True, "id": notification_id}

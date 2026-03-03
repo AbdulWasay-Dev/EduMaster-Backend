@@ -149,27 +149,33 @@ async def upload_document(
 
 @router.get("/", response_model=DocumentListResponse)
 async def list_documents(
-    subject_id: str,
+    subject_id: Optional[str] = None,
     current_user: dict = Depends(require_teacher())
 ):
     """
-    List documents for a subject
+    List documents for a subject (subject_id optional — if omitted returns all)
     """
     try:
         db = await get_database()
-        
-        # Verify user has access to the subject
-        subjects = await db.get_subjects(current_user["id"])
-        subject_ids = [str(s["id"]) for s in subjects]
-        
-        if subject_id not in subject_ids:
-            raise HTTPException(
-                status_code=403,
-                detail="Access denied to this subject"
-            )
-        
-        # Get documents
-        documents = await db.get_documents(subject_id)
+
+        if subject_id:
+            # Verify user has access to the subject
+            subjects = await db.get_subjects(current_user["id"])
+            subject_ids = [str(s["id"]) for s in subjects]
+            
+            if subject_id not in subject_ids:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied to this subject"
+                )
+            documents = await db.get_documents(subject_id)
+        else:
+            # Return all documents across all teacher's subjects
+            subjects = await db.get_subjects(current_user["id"])
+            documents = []
+            for s in subjects:
+                docs = await db.get_documents(str(s["id"]))
+                documents.extend(docs)
         
         document_responses = [
             DocumentResponse(
@@ -177,8 +183,8 @@ async def list_documents(
                 filename=doc["filename"],
                 original_filename=doc["original_filename"],
                 file_type=doc["file_type"],
-                file_size=doc["file_size"],
-                processing_status=doc["processing_status"],
+                file_size=doc.get("file_size", 0),
+                processing_status=doc.get("processing_status", "pending"),
                 subject_id=str(doc["subject_id"]),
                 created_at=str(doc["created_at"])
             )
@@ -300,6 +306,42 @@ async def get_document_status(
             status_code=500,
             detail="Internal server error"
         )
+
+
+@router.get("/{document_id}/chunks")
+async def get_document_chunks(
+    document_id: str,
+    current_user: dict = Depends(require_teacher())
+):
+    """
+    Get text chunks for a document (for preview)
+    """
+    try:
+        db = await get_database()
+        document = await db.get_document(document_id)
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+        if str(document["owner_id"]) != current_user["id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        chunks = await db.get_document_chunks(document_id)
+        return {
+            "chunks": [
+                {
+                    "id": str(c.get("id", "")),
+                    "chunk_index": c.get("chunk_index", 0),
+                    "content": c.get("text", ""),
+                    "char_count": len(c.get("text", "")),
+                    "metadata": c.get("metadata"),
+                }
+                for c in chunks
+            ]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting document chunks: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 async def process_document_async(document_id: str):
