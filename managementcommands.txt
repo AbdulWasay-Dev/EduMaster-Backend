@@ -1,0 +1,16 @@
+# Check service status
+sudo systemctl status edumaster
+
+# Restart service
+sudo systemctl restart edumaster
+
+# View logs
+sudo journalctl -u edumaster -f
+
+# Stop service
+sudo systemctl stop edumaster
+
+# Start service
+sudo systemctl start edumaster
+
+
