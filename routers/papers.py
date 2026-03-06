@@ -305,30 +305,7 @@ async def generate_paper(
                 detail="Failed to create paper"
             )
         
-        _cfg = paper.get("configuration") or {}
-        if isinstance(_cfg, str):
-            import json as _json
-            _cfg = _json.loads(_cfg)
-        return PaperResponse(
-            id=str(paper["id"]),
-            title=paper["title"],
-            description=paper.get("description") or "",
-            subject_id=str(paper["subject_id"]),
-            class_id=str(paper["class_id"]) if paper.get("class_id") else None,
-            questions=paper.get("questions") or [],
-            answer_key=paper.get("answer_key") or {},
-            total_marks=paper.get("total_marks") or 0,
-            is_published=paper.get("is_published", False),
-            created_at=str(paper["created_at"]),
-            difficulty_level=_cfg.get("difficulty_level", request.difficulty_level),
-            template=_cfg.get("template", request.template),
-            institution_name=_cfg.get("institution_name", request.institution_name),
-            course_name=_cfg.get("course_name", request.course_name),
-            exam_date=_cfg.get("exam_date", request.exam_date),
-            duration=_cfg.get("duration", request.duration),
-            instructions=_cfg.get("instructions", request.instructions),
-            student_fields=_cfg.get("student_fields", request.student_fields),
-        )
+        return PaperResponse(**_serialize_paper(paper))
 
     except HTTPException:
         raise
@@ -478,18 +455,7 @@ async def create_paper_from_question_sheet(
                 detail="Failed to create paper"
             )
         
-        return PaperResponse(
-            id=paper["id"],
-            title=paper["title"],
-            description=paper["description"],
-            subject_id=paper["subject_id"],
-            class_id=paper.get("class_id"),
-            questions=paper["questions"],
-            answer_key=paper["answer_key"],
-            total_marks=paper["total_marks"],
-            is_published=paper["is_published"],
-            created_at=paper["created_at"]
-        )
+        return PaperResponse(**_serialize_paper(paper))
         
     except HTTPException:
         raise
@@ -577,18 +543,7 @@ async def publish_paper(
                 detail="Failed to publish paper"
             )
         
-        return PaperResponse(
-            id=str(updated_paper["id"]),
-            title=updated_paper["title"],
-            description=updated_paper.get("description") or "",
-            subject_id=str(updated_paper["subject_id"]),
-            class_id=str(updated_paper["class_id"]) if updated_paper.get("class_id") else None,
-            questions=updated_paper.get("questions") or [],
-            answer_key=updated_paper.get("answer_key") or {},
-            total_marks=updated_paper.get("total_marks") or 0,
-            is_published=updated_paper.get("is_published", False),
-            created_at=str(updated_paper["created_at"]),
-        )
+        return PaperResponse(**_serialize_paper(updated_paper))
         
     except HTTPException:
         raise
@@ -1379,21 +1334,25 @@ async def delete_paper(
 
 def _serialize_paper(paper: dict) -> dict:
     """Serialize a paper DB row to a JSON-safe dict"""
-    cfg = paper.get("configuration") or {}
-    if isinstance(cfg, str):
-        import json as _j
-        try:
-            cfg = _j.loads(cfg)
-        except Exception:
-            cfg = {}
+    import json as _j
+
+    def _parse_json(val, default):
+        if isinstance(val, str):
+            try:
+                return _j.loads(val)
+            except Exception:
+                return default
+        return val if val is not None else default
+
+    cfg = _parse_json(paper.get("configuration"), {})
     return {
         "id": str(paper["id"]),
         "title": paper.get("title", ""),
         "description": paper.get("description") or "",
         "subject_id": str(paper["subject_id"]),
         "class_id": str(paper["class_id"]) if paper.get("class_id") else None,
-        "questions": paper.get("questions") or [],
-        "answer_key": paper.get("answer_key") or {},
+        "questions": _parse_json(paper.get("questions"), []),
+        "answer_key": _parse_json(paper.get("answer_key"), {}),
         "total_marks": paper.get("total_marks") or 0,
         "is_published": paper.get("is_published", False),
         "difficulty_level": cfg.get("difficulty_level", "medium"),

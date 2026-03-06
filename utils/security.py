@@ -163,3 +163,77 @@ def check_resource_ownership(resource_owner_id: str):
         return current_user
     
     return ownership_checker
+
+
+# ==================== Student Authentication ====================
+
+async def get_current_student(token_data: dict = Depends(verify_token)) -> dict:
+    """Get current student account from token"""
+    from services.database import get_database
+    
+    payload = token_data.get("payload", {})
+    role = payload.get("role", "")
+    
+    if role != "student":
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied. Student account required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    db = await get_database()
+    student = await db.get_student_account(token_data["user_id"])
+    
+    if student is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Student account not found or access denied",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    student["id"] = str(student["id"])
+    if student.get("class_id"):
+        student["class_id"] = str(student["class_id"])
+    return student
+
+
+def require_student():
+    """Require student role"""
+    async def student_checker(current_student: dict = Depends(get_current_student)) -> dict:
+        if not current_student.get("is_active", True):
+            raise HTTPException(
+                status_code=403,
+                detail="Student account is inactive"
+            )
+        return current_student
+    return student_checker
+
+
+async def get_current_user_any_role(token_data: dict = Depends(verify_token)) -> dict:
+    """Get current user regardless of role (teacher or student)"""
+    from services.database import get_database
+    
+    payload = token_data.get("payload", {})
+    role = payload.get("role", "teacher")
+    
+    db = await get_database()
+    
+    if role == "student":
+        user = await db.get_student_account(token_data["user_id"])
+        if user:
+            user["id"] = str(user["id"])
+            user["role"] = "student"
+            if user.get("class_id"):
+                user["class_id"] = str(user["class_id"])
+            return user
+    else:
+        user = await db.get_teacher(token_data["user_id"])
+        if user:
+            user["id"] = str(user["id"])
+            return user
+    
+    raise HTTPException(
+        status_code=401,
+        detail="User not found",
+        headers={"WWW-Authenticate": "Bearer"},
+    )

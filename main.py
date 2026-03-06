@@ -14,7 +14,9 @@ import uvicorn
 from config import get_settings, Settings
 from utils.security import setup_security_middleware
 from utils.logging_config import setup_logging
+from services.database import get_database
 from routers import auth, subjects, documents, rag, grading, classes, students, analytics, notifications, papers
+from routers import student_auth, assignments, student_portal
 
 
 # Global settings
@@ -33,13 +35,20 @@ async def lifespan(app: FastAPI):
     logger.info(f"Environment: {settings.environment}")
     logger.info(f"Debug mode: {settings.debug}")
     
-    # Initialize services here if needed
-    # await initialize_services()
+    # Initialize database (creates DB/tables/indexes if needed) and ChromaDB
+    try:
+        db = await get_database()
+        logger.info("✅ Database and ChromaDB ready")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize database: {e}")
+        raise
     
     yield
     
     # Shutdown
     logger.info("🛑 Shutting down EduMaster Backend...")
+    if db:
+        await db.close()
 
 
 # Create FastAPI application
@@ -188,6 +197,24 @@ app.include_router(
     papers.router,
     prefix=f"{settings.api_v1_prefix}/papers",
     tags=["Papers"]
+)
+
+app.include_router(
+    student_auth.router,
+    prefix=f"{settings.api_v1_prefix}/student-auth",
+    tags=["Student Authentication"]
+)
+
+app.include_router(
+    assignments.router,
+    prefix=f"{settings.api_v1_prefix}/assignments",
+    tags=["Assignments"]
+)
+
+app.include_router(
+    student_portal.router,
+    prefix=f"{settings.api_v1_prefix}/student",
+    tags=["Student Portal"]
 )
 
 

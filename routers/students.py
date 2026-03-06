@@ -338,32 +338,212 @@ async def delete_student(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.post("/enroll")
-async def enroll_student(
-    enrollment_data: StudentEnrollment,
-    current_user: dict = Depends(get_current_teacher)
+# ─── Student Account Management (Teacher) ────────────────────────
+
+class BulkStudentItem(BaseModel):
+    student_name: str
+    email: str
+    student_id: Optional[str] = None
+
+
+class BulkImportRequest(BaseModel):
+    class_id: str
+    students: List[BulkStudentItem]
+
+
+@router.patch("/accounts/{account_id}/verify")
+async def verify_student_account(
+    account_id: str,
+    current_user: dict = Depends(require_teacher()),
 ):
-    """Enroll student in a class (for student self-enrollment)"""
+    """Verify (approve) a pending student account"""
     try:
-        # This endpoint is for students to self-enroll using a class code
-        # Implementation would require class codes and student authentication
-        # For now, return a placeholder response
-        return {"message": "Student enrollment functionality coming soon"}
-        
+        db = await get_database()
+        account = await db.get_student_account(account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="Student account not found")
+
+        # Verify teacher owns the class
+        classes = await db.get_classes(current_user["id"])
+        class_ids = [str(c["id"]) for c in classes]
+        if str(account.get("class_id")) not in class_ids:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        updated = await db.update_student_account(account_id, {"is_verified": True})
+        if not updated:
+            raise HTTPException(status_code=500, detail="Failed to verify student")
+
+        return {"message": "Student account verified", "id": account_id}
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error in student enrollment: {e}")
+        logger.error(f"Error verifying student account: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.get("/classes")
-async def get_student_classes(current_user: dict = Depends(get_current_teacher)):
-    """Get student's enrolled classes (for student view)"""
+@router.patch("/accounts/{account_id}/reject")
+async def reject_student_account(
+    account_id: str,
+    current_user: dict = Depends(require_teacher()),
+):
+    """Reject (deactivate) a pending student account"""
     try:
-        # This endpoint is for students to view their enrolled classes
-        # Implementation would require student authentication
-        # For now, return a placeholder response
-        return {"classes": []}
-        
+        db = await get_database()
+        account = await db.get_student_account(account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="Student account not found")
+
+        classes = await db.get_classes(current_user["id"])
+        class_ids = [str(c["id"]) for c in classes]
+        if str(account.get("class_id")) not in class_ids:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        updated = await db.update_student_account(account_id, {"is_active": False})
+        if not updated:
+            raise HTTPException(status_code=500, detail="Failed to reject student")
+
+        return {"message": "Student account rejected", "id": account_id}
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error getting student classes: {e}")
+        logger.error(f"Error rejecting student account: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/accounts/class/{class_id}")
+async def list_student_accounts(
+    class_id: str,
+    verified_only: bool = False,
+    current_user: dict = Depends(require_teacher()),
+):
+    """List student accounts for a class"""
+    try:
+        db = await get_database()
+        classes = await db.get_classes(current_user["id"])
+        class_ids = [str(c["id"]) for c in classes]
+        if class_id not in class_ids:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        accounts = await db.get_student_accounts_by_class(class_id, verified_only=verified_only)
+        return [
+            {
+                "id": str(a["id"]),
+                "full_name": a.get("full_name", ""),
+                "email": a.get("email", ""),
+                "is_verified": a.get("is_verified", False),
+                "is_active": a.get("is_active", True),
+                "created_at": str(a.get("created_at", "")),
+            }
+            for a in accounts
+        ]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing student accounts: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post("/bulk-import")
+async def bulk_import_students(
+    data: BulkImportRequest,
+    current_user: dict = Depends(require_teacher()),
+):
+    """Bulk import students into a class (creates student records)"""
+    try:
+        db = await get_database()
+        classes = await db.get_classes(current_user["id"])
+        class_ids = [str(c["id"]) for c in classes]
+        if data.class_id not in class_ids:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        created = []
+        errors = []
+        for item in data.students:
+            try:
+                student = await db.create_student({
+                    "student_name": item.student_name,
+                    "email": item.email,
+                    "student_id": item.student_id,
+                    "class_id": data.class_id,
+                })
+                if student:
+                    created.append(str(student["id"]))
+                else:
+                    errors.append({"name": item.student_name, "error": "Failed to create"})
+            except Exception as inner_e:
+                errors.append({"name": item.student_name, "error": str(inner_e)})
+
+        return {
+            "imported": len(created),
+            "failed": len(errors),
+            "errors": errors[:20],  # cap to 20
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Bulk import error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/{student_id}/scores")
+async def get_student_scores(
+    student_id: str,
+    current_user: dict = Depends(require_teacher()),
+):
+    """Get all graded scores for a student (teacher view)"""
+    try:
+        db = await get_database()
+        student = await db.get_student(student_id)
+        if not student:
+            raise HTTPException(status_code=404, detail="Student not found")
+
+        classes = await db.get_classes(current_user["id"])
+        class_ids = [str(c["id"]) for c in classes]
+        if str(student["class_id"]) not in class_ids:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        scores = await db.get_student_scores({"student_id": student_id})
+        return scores or []
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting student scores: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/{student_id}/submissions")
+async def get_student_submissions(
+    student_id: str,
+    current_user: dict = Depends(require_teacher()),
+):
+    """Get all submissions for a student (teacher view)"""
+    try:
+        db = await get_database()
+        student = await db.get_student(student_id)
+        if not student:
+            raise HTTPException(status_code=404, detail="Student not found")
+
+        classes = await db.get_classes(current_user["id"])
+        class_ids = [str(c["id"]) for c in classes]
+        if str(student["class_id"]) not in class_ids:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        submissions = await db.get_student_submissions(student_id)
+        return [
+            {
+                "id": str(s["id"]),
+                "assignment_id": str(s.get("assignment_id", "")),
+                "assignment_title": s.get("title", ""),
+                "status": s.get("status", ""),
+                "submitted_at": str(s["submitted_at"]) if s.get("submitted_at") else None,
+                "marks_obtained": s.get("marks_obtained"),
+                "percentage": s.get("percentage"),
+                "grade": s.get("grade"),
+            }
+            for s in submissions
+        ]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting student submissions: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")

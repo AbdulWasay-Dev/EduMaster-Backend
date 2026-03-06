@@ -26,10 +26,382 @@ class DatabaseService:
     
     _pool: Optional[Pool] = None
     _chroma_client: Optional[chromadb.Client] = None
-    
+
+    # ==================== Schema SQL ====================
+    # All tables are created with IF NOT EXISTS so this is safe to run on every startup.
+
+    SCHEMA_SQL = """
+    -- Enable required extensions
+    CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+    -- ==================== Core Tables ====================
+
+    CREATE TABLE IF NOT EXISTS teachers (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'teacher' CHECK (role IN ('teacher', 'admin')),
+        profile_image_url TEXT,
+        school_name TEXT,
+        department TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS classes (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        teacher_id UUID REFERENCES teachers(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        description TEXT,
+        grade_level TEXT,
+        subject_area TEXT,
+        academic_year TEXT,
+        is_active BOOLEAN DEFAULT TRUE,
+        class_code TEXT UNIQUE,
+        max_students INTEGER DEFAULT 100,
+        allow_student_signup BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS students (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        class_id UUID REFERENCES classes(id) ON DELETE CASCADE,
+        student_name TEXT NOT NULL,
+        student_id TEXT,
+        email TEXT,
+        phone TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS subjects (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        teacher_id UUID REFERENCES teachers(id) ON DELETE CASCADE,
+        class_id UUID REFERENCES classes(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        description TEXT,
+        color_code TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS documents (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        subject_id UUID REFERENCES subjects(id) ON DELETE CASCADE,
+        owner_id UUID REFERENCES teachers(id) ON DELETE CASCADE,
+        filename TEXT NOT NULL,
+        original_filename TEXT NOT NULL,
+        storage_path TEXT NOT NULL,
+        file_type TEXT NOT NULL CHECK (file_type IN ('pdf', 'pptx', 'docx', 'png', 'jpg', 'jpeg')),
+        file_size BIGINT,
+        page_count INTEGER,
+        processing_status TEXT DEFAULT 'pending' CHECK (processing_status IN ('pending', 'processing', 'completed', 'failed')),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS doc_chunks (
+        id BIGSERIAL PRIMARY KEY,
+        document_id UUID REFERENCES documents(id) ON DELETE CASCADE,
+        subject_id UUID REFERENCES subjects(id) ON DELETE CASCADE,
+        owner_id UUID REFERENCES teachers(id) ON DELETE CASCADE,
+        chunk_index INTEGER NOT NULL,
+        chunk_type TEXT DEFAULT 'paragraph' CHECK (chunk_type IN ('section', 'paragraph', 'list', 'table')),
+        text TEXT NOT NULL,
+        metadata JSONB,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS papers (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        subject_id UUID REFERENCES subjects(id) ON DELETE CASCADE,
+        class_id UUID REFERENCES classes(id),
+        owner_id UUID REFERENCES teachers(id),
+        title TEXT NOT NULL,
+        description TEXT,
+        questions JSONB NOT NULL,
+        configuration JSONB,
+        answer_key JSONB NOT NULL,
+        total_marks DECIMAL(5,2),
+        is_published BOOLEAN DEFAULT FALSE,
+        published_at TIMESTAMP WITH TIME ZONE,
+        due_date TIMESTAMP WITH TIME ZONE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS submissions (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        paper_id UUID REFERENCES papers(id) ON DELETE CASCADE,
+        student_id UUID REFERENCES students(id) ON DELETE CASCADE,
+        class_id UUID REFERENCES classes(id) ON DELETE CASCADE,
+        student_name TEXT NOT NULL,
+        storage_path TEXT,
+        ocr_text TEXT,
+        submission_data JSONB,
+        total_score DECIMAL(5,2),
+        grade_percentage DECIMAL(5,2),
+        feedback TEXT,
+        grading_status TEXT DEFAULT 'pending' CHECK (grading_status IN ('pending', 'grading', 'completed')),
+        submitted_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        graded_at TIMESTAMP WITH TIME ZONE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS notifications (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID REFERENCES teachers(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        message TEXT NOT NULL,
+        notification_type TEXT NOT NULL CHECK (notification_type IN ('paper_assigned', 'grade_available', 'deadline_reminder', 'document_processed')),
+        is_read BOOLEAN DEFAULT FALSE,
+        metadata JSONB,
+        student_account_id UUID,
+        audience TEXT DEFAULT 'teacher',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    -- ==================== Phase 2 Tables ====================
+
+    CREATE TABLE IF NOT EXISTS student_accounts (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        full_name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        phone TEXT,
+        date_of_birth DATE,
+        gender TEXT CHECK (gender IN ('male', 'female', 'other', 'prefer_not_to_say')),
+        profile_image_url TEXT,
+        roll_number TEXT,
+        student_id TEXT,
+        class_id UUID REFERENCES classes(id) ON DELETE SET NULL,
+        student_record_id UUID REFERENCES students(id) ON DELETE SET NULL,
+        is_active BOOLEAN DEFAULT TRUE,
+        is_verified BOOLEAN DEFAULT FALSE,
+        joined_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS assignments (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        teacher_id UUID REFERENCES teachers(id) ON DELETE CASCADE NOT NULL,
+        subject_id UUID REFERENCES subjects(id) ON DELETE CASCADE NOT NULL,
+        class_id UUID REFERENCES classes(id) ON DELETE CASCADE NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        instructions TEXT,
+        total_marks INTEGER NOT NULL DEFAULT 10,
+        due_date TIMESTAMP WITH TIME ZONE,
+        attachment_url TEXT,
+        attachment_filename TEXT,
+        grading_rubric TEXT,
+        auto_grade BOOLEAN DEFAULT TRUE,
+        status TEXT DEFAULT 'draft' CHECK (status IN ('draft', 'published', 'closed')),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS assignment_submissions (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        assignment_id UUID REFERENCES assignments(id) ON DELETE CASCADE NOT NULL,
+        student_account_id UUID REFERENCES student_accounts(id) ON DELETE CASCADE NOT NULL,
+        class_id UUID REFERENCES classes(id) ON DELETE CASCADE NOT NULL,
+        submission_text TEXT,
+        submission_files JSONB DEFAULT '[]',
+        marks_obtained NUMERIC(5,2),
+        max_marks INTEGER,
+        percentage NUMERIC(5,2),
+        grade TEXT,
+        ai_feedback TEXT,
+        ai_rubric_breakdown JSONB,
+        teacher_remarks TEXT,
+        teacher_override_marks NUMERIC(5,2),
+        status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'submitted', 'grading', 'graded', 'returned')),
+        submitted_at TIMESTAMP WITH TIME ZONE,
+        graded_at TIMESTAMP WITH TIME ZONE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        UNIQUE (assignment_id, student_account_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS student_scores (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        student_account_id UUID REFERENCES student_accounts(id) ON DELETE CASCADE NOT NULL,
+        class_id UUID REFERENCES classes(id) ON DELETE CASCADE NOT NULL,
+        subject_id UUID REFERENCES subjects(id) ON DELETE CASCADE,
+        score_type TEXT NOT NULL CHECK (score_type IN ('assignment', 'paper', 'quiz')),
+        reference_id UUID NOT NULL,
+        title TEXT,
+        marks_obtained NUMERIC(5,2),
+        max_marks NUMERIC(5,2),
+        percentage NUMERIC(5,2),
+        grade TEXT,
+        scored_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    -- ==================== Enhanced Grading Tables ====================
+
+    CREATE TABLE IF NOT EXISTS submission_images (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        submission_id UUID REFERENCES submissions(id) ON DELETE CASCADE,
+        image_index INTEGER NOT NULL,
+        image_type TEXT DEFAULT 'jpeg' CHECK (image_type IN ('jpeg', 'jpg', 'png', 'gif', 'bmp')),
+        file_size BIGINT,
+        ocr_text TEXT,
+        ocr_confidence DECIMAL(3,2),
+        processing_status TEXT DEFAULT 'pending' CHECK (processing_status IN ('pending', 'processing', 'completed', 'failed')),
+        error_message TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS question_grading_details (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        submission_id UUID REFERENCES submissions(id) ON DELETE CASCADE,
+        question_id TEXT NOT NULL,
+        question_text TEXT NOT NULL,
+        question_type TEXT NOT NULL CHECK (question_type IN ('mcq', 'true_false', 'short_answer', 'essay', 'fill_blank')),
+        student_answer TEXT,
+        correct_answer TEXT,
+        score DECIMAL(5,2) NOT NULL DEFAULT 0,
+        max_score DECIMAL(5,2) NOT NULL,
+        feedback TEXT,
+        ai_confidence DECIMAL(3,2),
+        grading_method TEXT DEFAULT 'ai' CHECK (grading_method IN ('ai', 'manual', 'auto')),
+        is_correct BOOLEAN,
+        partial_credit DECIMAL(3,2) DEFAULT 0,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS ocr_processing_logs (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        submission_id UUID REFERENCES submissions(id) ON DELETE CASCADE,
+        image_id UUID REFERENCES submission_images(id) ON DELETE CASCADE,
+        ocr_service TEXT DEFAULT 'mistral' CHECK (ocr_service IN ('mistral', 'tesseract', 'google_vision')),
+        processing_time_ms INTEGER,
+        raw_ocr_response JSONB,
+        extracted_text TEXT,
+        confidence_score DECIMAL(3,2),
+        error_details TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS grading_audit_log (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        submission_id UUID REFERENCES submissions(id) ON DELETE CASCADE,
+        action_type TEXT NOT NULL CHECK (action_type IN ('graded', 'regraded', 'manual_override', 'grade_adjusted')),
+        previous_score DECIMAL(5,2),
+        new_score DECIMAL(5,2),
+        previous_percentage DECIMAL(5,2),
+        new_percentage DECIMAL(5,2),
+        changed_by UUID REFERENCES teachers(id),
+        change_reason TEXT,
+        metadata JSONB,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS batch_grading_jobs (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        teacher_id UUID REFERENCES teachers(id) ON DELETE CASCADE,
+        paper_id UUID REFERENCES papers(id) ON DELETE CASCADE,
+        class_id UUID REFERENCES classes(id) ON DELETE CASCADE,
+        job_name TEXT,
+        total_submissions INTEGER DEFAULT 0,
+        processed_submissions INTEGER DEFAULT 0,
+        successful_submissions INTEGER DEFAULT 0,
+        failed_submissions INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'cancelled')),
+        grading_settings JSONB,
+        error_log TEXT,
+        started_at TIMESTAMP WITH TIME ZONE,
+        completed_at TIMESTAMP WITH TIME ZONE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    -- ==================== Indexes ====================
+
+    CREATE INDEX IF NOT EXISTS idx_teachers_email ON teachers(email);
+    CREATE INDEX IF NOT EXISTS idx_subjects_teacher_id ON subjects(teacher_id);
+    CREATE INDEX IF NOT EXISTS idx_subjects_class_id ON subjects(class_id);
+    CREATE INDEX IF NOT EXISTS idx_documents_subject_id ON documents(subject_id);
+    CREATE INDEX IF NOT EXISTS idx_doc_chunks_document ON doc_chunks(document_id);
+    CREATE INDEX IF NOT EXISTS idx_doc_chunks_subject ON doc_chunks(subject_id);
+    CREATE INDEX IF NOT EXISTS idx_doc_chunks_owner ON doc_chunks(owner_id);
+    CREATE INDEX IF NOT EXISTS idx_papers_subject_id ON papers(subject_id);
+    CREATE INDEX IF NOT EXISTS idx_papers_owner_id ON papers(owner_id);
+    CREATE INDEX IF NOT EXISTS idx_papers_class_id ON papers(class_id);
+    CREATE INDEX IF NOT EXISTS idx_submissions_paper ON submissions(paper_id);
+    CREATE INDEX IF NOT EXISTS idx_submissions_student ON submissions(student_id);
+    CREATE INDEX IF NOT EXISTS idx_submissions_class ON submissions(class_id);
+    CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
+    CREATE INDEX IF NOT EXISTS idx_student_accounts_class ON student_accounts(class_id);
+    CREATE INDEX IF NOT EXISTS idx_student_accounts_email ON student_accounts(email);
+    CREATE INDEX IF NOT EXISTS idx_assignments_teacher ON assignments(teacher_id);
+    CREATE INDEX IF NOT EXISTS idx_assignments_class ON assignments(class_id);
+    CREATE INDEX IF NOT EXISTS idx_assignments_subject ON assignments(subject_id);
+    CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
+    CREATE INDEX IF NOT EXISTS idx_asub_assignment ON assignment_submissions(assignment_id);
+    CREATE INDEX IF NOT EXISTS idx_asub_student ON assignment_submissions(student_account_id);
+    CREATE INDEX IF NOT EXISTS idx_asub_status ON assignment_submissions(status);
+    CREATE INDEX IF NOT EXISTS idx_scores_student ON student_scores(student_account_id);
+    CREATE INDEX IF NOT EXISTS idx_scores_class ON student_scores(class_id);
+    CREATE INDEX IF NOT EXISTS idx_submission_images_submission ON submission_images(submission_id);
+    CREATE INDEX IF NOT EXISTS idx_question_grading_submission ON question_grading_details(submission_id);
+    CREATE INDEX IF NOT EXISTS idx_ocr_logs_submission ON ocr_processing_logs(submission_id);
+    CREATE INDEX IF NOT EXISTS idx_grading_audit_submission ON grading_audit_log(submission_id);
+    CREATE INDEX IF NOT EXISTS idx_batch_jobs_teacher ON batch_grading_jobs(teacher_id);
+    CREATE INDEX IF NOT EXISTS idx_batch_jobs_status ON batch_grading_jobs(status);
+
+    -- ==================== Triggers ====================
+
+    CREATE OR REPLACE FUNCTION update_updated_at_column()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        NEW.updated_at = NOW();
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    DROP TRIGGER IF EXISTS update_teachers_updated_at ON teachers;
+    CREATE TRIGGER update_teachers_updated_at BEFORE UPDATE ON teachers
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+    DROP TRIGGER IF EXISTS update_classes_updated_at ON classes;
+    CREATE TRIGGER update_classes_updated_at BEFORE UPDATE ON classes
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+    DROP TRIGGER IF EXISTS update_subjects_updated_at ON subjects;
+    CREATE TRIGGER update_subjects_updated_at BEFORE UPDATE ON subjects
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+    DROP TRIGGER IF EXISTS update_documents_updated_at ON documents;
+    CREATE TRIGGER update_documents_updated_at BEFORE UPDATE ON documents
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+    DROP TRIGGER IF EXISTS update_papers_updated_at ON papers;
+    CREATE TRIGGER update_papers_updated_at BEFORE UPDATE ON papers
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+    DROP TRIGGER IF EXISTS update_student_accounts_updated_at ON student_accounts;
+    CREATE TRIGGER update_student_accounts_updated_at BEFORE UPDATE ON student_accounts
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+    DROP TRIGGER IF EXISTS update_assignments_updated_at ON assignments;
+    CREATE TRIGGER update_assignments_updated_at BEFORE UPDATE ON assignments
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+    DROP TRIGGER IF EXISTS update_assignment_submissions_updated_at ON assignment_submissions;
+    CREATE TRIGGER update_assignment_submissions_updated_at BEFORE UPDATE ON assignment_submissions
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    """
+
     async def initialize(self):
-        """Initialize connection pools and clients"""
-        # Initialize PostgreSQL
+        """Initialize connection pools, create schema, and set up ChromaDB"""
+        # 1. Ensure the target database exists
+        await self._ensure_database_exists()
+
+        # 2. Initialize PostgreSQL pool
         if self._pool is None:
             try:
                 self._pool = await asyncpg.create_pool(
@@ -43,7 +415,10 @@ class DatabaseService:
                 logger.error(f"❌ Failed to initialize PostgreSQL pool: {e}")
                 raise
 
-        # Initialize ChromaDB
+        # 3. Run schema migrations (idempotent)
+        await self._init_schema()
+
+        # 4. Initialize ChromaDB
         if self._chroma_client is None:
             try:
                 os.makedirs(settings.chroma_db_path, exist_ok=True)
@@ -55,6 +430,44 @@ class DatabaseService:
             except Exception as e:
                 logger.error(f"❌ Failed to initialize ChromaDB: {e}")
                 raise
+
+    async def _ensure_database_exists(self):
+        """Create the target database if it does not already exist."""
+        db_url = settings.database_url
+        try:
+            base_url, db_name = db_url.rsplit("/", 1)
+            # Strip query params from db_name if any
+            if "?" in db_name:
+                db_name = db_name.split("?")[0]
+            postgres_url = f"{base_url}/postgres"
+        except ValueError:
+            logger.warning("Could not parse database name from URL — skipping auto-create.")
+            return
+
+        try:
+            conn = await asyncpg.connect(postgres_url)
+            exists = await conn.fetchval(
+                "SELECT 1 FROM pg_database WHERE datname = $1", db_name
+            )
+            if not exists:
+                # CREATE DATABASE cannot run inside a transaction block
+                await conn.execute(f'CREATE DATABASE "{db_name}"')
+                logger.info(f"✨ Created database '{db_name}'")
+            else:
+                logger.info(f"👍 Database '{db_name}' already exists")
+            await conn.close()
+        except Exception as e:
+            logger.warning(f"Could not auto-create database (will try to connect anyway): {e}")
+
+    async def _init_schema(self):
+        """Execute the schema SQL to create all tables/indexes/triggers (idempotent)."""
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(self.SCHEMA_SQL)
+            logger.info("✅ Database schema verified / created successfully")
+        except Exception as e:
+            logger.error(f"❌ Error initialising database schema: {e}")
+            raise
     
     async def close(self):
         """Close connection pool"""
@@ -790,6 +1203,516 @@ class DatabaseService:
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error getting chunks for subject {subject_id}: {e}")
+            return []
+
+    # ==================== Student Account Operations ====================
+
+    async def create_student_account(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Create a student account (login-capable)"""
+        try:
+            sid = data.get("id") or str(uuid.uuid4())
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO student_accounts
+                        (id, full_name, email, password_hash, phone, date_of_birth, gender,
+                         profile_image_url, roll_number, student_id, class_id, is_verified)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                    RETURNING *
+                    """,
+                    uuid.UUID(sid),
+                    data["full_name"],
+                    data["email"],
+                    data["password_hash"],
+                    data.get("phone"),
+                    data.get("date_of_birth"),
+                    data.get("gender"),
+                    data.get("profile_image_url"),
+                    data.get("roll_number"),
+                    data.get("student_id"),
+                    uuid.UUID(data["class_id"]) if data.get("class_id") else None,
+                    data.get("is_verified", False),
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error creating student account: {e}")
+            return None
+
+    async def get_student_account(self, account_id: str) -> Optional[Dict[str, Any]]:
+        """Get student account by ID"""
+        try:
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    "SELECT * FROM student_accounts WHERE id = $1",
+                    uuid.UUID(account_id),
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting student account {account_id}: {e}")
+            return None
+
+    async def get_student_account_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        """Get student account by email"""
+        try:
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    "SELECT * FROM student_accounts WHERE email = $1",
+                    email,
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting student account by email {email}: {e}")
+            return None
+
+    async def update_student_account(self, account_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Update student account"""
+        try:
+            set_clauses = []
+            values = []
+            idx = 1
+            for key, value in data.items():
+                if key != "id":
+                    set_clauses.append(f"{key} = ${idx}")
+                    values.append(value)
+                    idx += 1
+            if not set_clauses:
+                return await self.get_student_account(account_id)
+            values.append(uuid.UUID(account_id))
+            query = f"UPDATE student_accounts SET {', '.join(set_clauses)}, updated_at = NOW() WHERE id = ${idx} RETURNING *"
+            async with self.connection() as conn:
+                row = await conn.fetchrow(query, *values)
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error updating student account {account_id}: {e}")
+            return None
+
+    async def get_student_accounts_by_class(self, class_id: str, verified_only: bool = False) -> List[Dict[str, Any]]:
+        """Get all student accounts in a class"""
+        try:
+            q = "SELECT * FROM student_accounts WHERE class_id = $1"
+            if verified_only:
+                q += " AND is_verified = TRUE"
+            q += " ORDER BY full_name"
+            async with self.connection() as conn:
+                rows = await conn.fetch(q, uuid.UUID(class_id))
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting student accounts for class {class_id}: {e}")
+            return []
+
+    async def get_pending_student_accounts(self, class_id: str) -> List[Dict[str, Any]]:
+        """Get unverified student accounts for a class"""
+        try:
+            async with self.connection() as conn:
+                rows = await conn.fetch(
+                    "SELECT * FROM student_accounts WHERE class_id = $1 AND is_verified = FALSE ORDER BY joined_at DESC",
+                    uuid.UUID(class_id),
+                )
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting pending students for class {class_id}: {e}")
+            return []
+
+    # ==================== Class Code Operations ====================
+
+    async def get_class_by_code(self, class_code: str) -> Optional[Dict[str, Any]]:
+        """Get class by join code"""
+        try:
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    "SELECT * FROM classes WHERE class_code = $1",
+                    class_code,
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting class by code {class_code}: {e}")
+            return None
+
+    async def set_class_code(self, class_id: str, code: str) -> Optional[Dict[str, Any]]:
+        """Set or update class join code"""
+        try:
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    "UPDATE classes SET class_code = $1, updated_at = NOW() WHERE id = $2 RETURNING *",
+                    code,
+                    uuid.UUID(class_id),
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error setting class code for {class_id}: {e}")
+            return None
+
+    async def update_class(self, class_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Update class fields"""
+        try:
+            set_clauses = []
+            values = []
+            idx = 1
+            for key, value in data.items():
+                if key != "id":
+                    set_clauses.append(f"{key} = ${idx}")
+                    values.append(value)
+                    idx += 1
+            if not set_clauses:
+                return await self.get_class(class_id)
+            values.append(uuid.UUID(class_id))
+            query = f"UPDATE classes SET {', '.join(set_clauses)}, updated_at = NOW() WHERE id = ${idx} RETURNING *"
+            async with self.connection() as conn:
+                row = await conn.fetchrow(query, *values)
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error updating class {class_id}: {e}")
+            return None
+
+    # ==================== Assignment Operations ====================
+
+    async def create_assignment(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Create a new assignment"""
+        try:
+            aid = data.get("id") or str(uuid.uuid4())
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO assignments
+                        (id, teacher_id, subject_id, class_id, title, description, instructions,
+                         total_marks, due_date, attachment_url, attachment_filename,
+                         grading_rubric, auto_grade, status)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                    RETURNING *
+                    """,
+                    uuid.UUID(aid),
+                    uuid.UUID(data["teacher_id"]),
+                    uuid.UUID(data["subject_id"]),
+                    uuid.UUID(data["class_id"]),
+                    data["title"],
+                    data.get("description"),
+                    data.get("instructions"),
+                    data.get("total_marks", 10),
+                    data.get("due_date"),
+                    data.get("attachment_url"),
+                    data.get("attachment_filename"),
+                    data.get("grading_rubric"),
+                    data.get("auto_grade", True),
+                    data.get("status", "draft"),
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error creating assignment: {e}")
+            return None
+
+    async def get_assignment(self, assignment_id: str) -> Optional[Dict[str, Any]]:
+        """Get assignment by ID"""
+        try:
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    "SELECT * FROM assignments WHERE id = $1",
+                    uuid.UUID(assignment_id),
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting assignment {assignment_id}: {e}")
+            return None
+
+    async def get_assignments(self, teacher_id: str, class_id: str = None, subject_id: str = None, status: str = None) -> List[Dict[str, Any]]:
+        """Get assignments with optional filters"""
+        try:
+            q = "SELECT * FROM assignments WHERE teacher_id = $1"
+            params: list = [uuid.UUID(teacher_id)]
+            idx = 2
+            if class_id:
+                q += f" AND class_id = ${idx}"
+                params.append(uuid.UUID(class_id))
+                idx += 1
+            if subject_id:
+                q += f" AND subject_id = ${idx}"
+                params.append(uuid.UUID(subject_id))
+                idx += 1
+            if status:
+                q += f" AND status = ${idx}"
+                params.append(status)
+                idx += 1
+            q += " ORDER BY created_at DESC"
+            async with self.connection() as conn:
+                rows = await conn.fetch(q, *params)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting assignments: {e}")
+            return []
+
+    async def get_assignments_by_class(self, class_id: str, status: str = None) -> List[Dict[str, Any]]:
+        """Get assignments for a class (student view)"""
+        try:
+            q = "SELECT * FROM assignments WHERE class_id = $1"
+            params: list = [uuid.UUID(class_id)]
+            if status:
+                q += " AND status = $2"
+                params.append(status)
+            q += " ORDER BY due_date ASC NULLS LAST"
+            async with self.connection() as conn:
+                rows = await conn.fetch(q, *params)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting assignments for class {class_id}: {e}")
+            return []
+
+    async def update_assignment(self, assignment_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Update assignment"""
+        try:
+            set_clauses = []
+            values = []
+            idx = 1
+            for key, value in data.items():
+                if key != "id":
+                    set_clauses.append(f"{key} = ${idx}")
+                    values.append(value)
+                    idx += 1
+            if not set_clauses:
+                return await self.get_assignment(assignment_id)
+            values.append(uuid.UUID(assignment_id))
+            query = f"UPDATE assignments SET {', '.join(set_clauses)}, updated_at = NOW() WHERE id = ${idx} RETURNING *"
+            async with self.connection() as conn:
+                row = await conn.fetchrow(query, *values)
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error updating assignment {assignment_id}: {e}")
+            return None
+
+    async def delete_assignment(self, assignment_id: str) -> bool:
+        """Delete assignment"""
+        try:
+            async with self.connection() as conn:
+                await conn.execute("DELETE FROM assignments WHERE id = $1", uuid.UUID(assignment_id))
+                return True
+        except Exception as e:
+            logger.error(f"Error deleting assignment {assignment_id}: {e}")
+            return False
+
+    # ==================== Assignment Submission Operations ====================
+
+    async def create_assignment_submission(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Create or update an assignment submission"""
+        try:
+            sid = data.get("id") or str(uuid.uuid4())
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO assignment_submissions
+                        (id, assignment_id, student_account_id, class_id,
+                         submission_text, submission_files, status, submitted_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                    ON CONFLICT (assignment_id, student_account_id) DO UPDATE SET
+                        submission_text = EXCLUDED.submission_text,
+                        submission_files = EXCLUDED.submission_files,
+                        status = EXCLUDED.status,
+                        submitted_at = EXCLUDED.submitted_at,
+                        updated_at = NOW()
+                    RETURNING *
+                    """,
+                    uuid.UUID(sid),
+                    uuid.UUID(data["assignment_id"]),
+                    uuid.UUID(data["student_account_id"]),
+                    uuid.UUID(data["class_id"]),
+                    data.get("submission_text"),
+                    json.dumps(data.get("submission_files", [])),
+                    data.get("status", "submitted"),
+                    data.get("submitted_at"),
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error creating assignment submission: {e}")
+            return None
+
+    async def get_assignment_submission(self, submission_id: str) -> Optional[Dict[str, Any]]:
+        """Get single assignment submission"""
+        try:
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    "SELECT * FROM assignment_submissions WHERE id = $1",
+                    uuid.UUID(submission_id),
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting assignment submission {submission_id}: {e}")
+            return None
+
+    async def get_assignment_submission_by_student(self, assignment_id: str, student_account_id: str) -> Optional[Dict[str, Any]]:
+        """Get a student's submission for an assignment"""
+        try:
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    "SELECT * FROM assignment_submissions WHERE assignment_id = $1 AND student_account_id = $2",
+                    uuid.UUID(assignment_id),
+                    uuid.UUID(student_account_id),
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting submission: {e}")
+            return None
+
+    async def get_assignment_submissions(self, assignment_id: str) -> List[Dict[str, Any]]:
+        """Get all submissions for an assignment"""
+        try:
+            async with self.connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT s.*, sa.full_name as student_name, sa.roll_number, sa.email as student_email
+                    FROM assignment_submissions s
+                    JOIN student_accounts sa ON sa.id = s.student_account_id
+                    WHERE s.assignment_id = $1
+                    ORDER BY s.submitted_at DESC NULLS LAST
+                    """,
+                    uuid.UUID(assignment_id),
+                )
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting submissions for assignment {assignment_id}: {e}")
+            return []
+
+    async def update_assignment_submission(self, submission_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Update assignment submission (for grading results, etc.)"""
+        try:
+            set_clauses = []
+            values = []
+            idx = 1
+            for key, value in data.items():
+                if key == "id":
+                    continue
+                if key == "ai_rubric_breakdown" and isinstance(value, (dict, list)):
+                    value = json.dumps(value)
+                if key == "submission_files" and isinstance(value, list):
+                    value = json.dumps(value)
+                set_clauses.append(f"{key} = ${idx}")
+                values.append(value)
+                idx += 1
+            if not set_clauses:
+                return await self.get_assignment_submission(submission_id)
+            values.append(uuid.UUID(submission_id))
+            query = f"UPDATE assignment_submissions SET {', '.join(set_clauses)}, updated_at = NOW() WHERE id = ${idx} RETURNING *"
+            async with self.connection() as conn:
+                row = await conn.fetchrow(query, *values)
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error updating assignment submission {submission_id}: {e}")
+            return None
+
+    async def get_student_submissions(self, student_account_id: str) -> List[Dict[str, Any]]:
+        """Get all submissions for a student across assignments"""
+        try:
+            async with self.connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT s.*, a.title as assignment_title, a.total_marks as assignment_total_marks,
+                           a.due_date as assignment_due_date, a.subject_id
+                    FROM assignment_submissions s
+                    JOIN assignments a ON a.id = s.assignment_id
+                    WHERE s.student_account_id = $1
+                    ORDER BY s.submitted_at DESC NULLS LAST
+                    """,
+                    uuid.UUID(student_account_id),
+                )
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting submissions for student {student_account_id}: {e}")
+            return []
+
+    # ==================== Student Scores Operations ====================
+
+    async def create_student_score(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Record a student score"""
+        try:
+            sid = data.get("id") or str(uuid.uuid4())
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO student_scores
+                        (id, student_account_id, class_id, subject_id, score_type,
+                         reference_id, title, marks_obtained, max_marks, percentage, grade)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                    RETURNING *
+                    """,
+                    uuid.UUID(sid),
+                    uuid.UUID(data["student_account_id"]),
+                    uuid.UUID(data["class_id"]),
+                    uuid.UUID(data["subject_id"]) if data.get("subject_id") else None,
+                    data["score_type"],
+                    uuid.UUID(data["reference_id"]),
+                    data.get("title"),
+                    data.get("marks_obtained"),
+                    data.get("max_marks"),
+                    data.get("percentage"),
+                    data.get("grade"),
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error creating student score: {e}")
+            return None
+
+    async def get_student_scores(self, student_account_id: str, class_id: str = None, subject_id: str = None) -> List[Dict[str, Any]]:
+        """Get scores for a student"""
+        try:
+            q = "SELECT * FROM student_scores WHERE student_account_id = $1"
+            params: list = [uuid.UUID(student_account_id)]
+            idx = 2
+            if class_id:
+                q += f" AND class_id = ${idx}"
+                params.append(uuid.UUID(class_id))
+                idx += 1
+            if subject_id:
+                q += f" AND subject_id = ${idx}"
+                params.append(uuid.UUID(subject_id))
+                idx += 1
+            q += " ORDER BY scored_at DESC"
+            async with self.connection() as conn:
+                rows = await conn.fetch(q, *params)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting scores for student {student_account_id}: {e}")
+            return []
+
+    # ==================== Class Overview Helpers ====================
+
+    async def get_class_overview(self, class_id: str) -> Dict[str, Any]:
+        """Get aggregated overview for a class"""
+        try:
+            async with self.connection() as conn:
+                cid = uuid.UUID(class_id)
+                student_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM student_accounts WHERE class_id = $1", cid
+                ) or 0
+                subject_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM subjects WHERE class_id = $1", cid
+                ) or 0
+                assignment_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM assignments WHERE class_id = $1", cid
+                ) or 0
+                paper_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM papers WHERE class_id = $1", cid
+                ) or 0
+                pending_students = await conn.fetchval(
+                    "SELECT COUNT(*) FROM student_accounts WHERE class_id = $1 AND is_verified = FALSE", cid
+                ) or 0
+                return {
+                    "student_count": student_count,
+                    "subject_count": subject_count,
+                    "assignment_count": assignment_count,
+                    "paper_count": paper_count,
+                    "pending_students": pending_students,
+                }
+        except Exception as e:
+            logger.error(f"Error getting class overview for {class_id}: {e}")
+            return {"student_count": 0, "subject_count": 0, "assignment_count": 0, "paper_count": 0, "pending_students": 0}
+
+    async def get_subjects_by_class(self, class_id: str) -> List[Dict[str, Any]]:
+        """Get subjects belonging to a class"""
+        try:
+            async with self.connection() as conn:
+                rows = await conn.fetch(
+                    "SELECT * FROM subjects WHERE class_id = $1 ORDER BY name",
+                    uuid.UUID(class_id),
+                )
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting subjects for class {class_id}: {e}")
             return []
 
 
