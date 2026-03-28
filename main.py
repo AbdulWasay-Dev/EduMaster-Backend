@@ -3,6 +3,7 @@ EduMaster Backend - FastAPI Application
 Educational RAG System with AI-powered question generation and grading
 """
 import logging
+from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -81,6 +82,8 @@ if settings.environment == "production":
     )
 
 # Mount static files
+# Ensure static assets directory exists in fresh setups.
+Path("static").mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
