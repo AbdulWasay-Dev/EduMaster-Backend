@@ -1216,8 +1216,8 @@ class DatabaseService:
                     """
                     INSERT INTO student_accounts
                         (id, full_name, email, password_hash, phone, date_of_birth, gender,
-                         profile_image_url, roll_number, student_id, class_id, is_verified)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                         profile_image_url, roll_number, student_id, class_id, student_record_id, is_verified)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                     RETURNING *
                     """,
                     uuid.UUID(sid),
@@ -1231,6 +1231,7 @@ class DatabaseService:
                     data.get("roll_number"),
                     data.get("student_id"),
                     uuid.UUID(data["class_id"]) if data.get("class_id") else None,
+                    uuid.UUID(data["student_record_id"]) if data.get("student_record_id") else None,
                     data.get("is_verified", False),
                 )
                 return dict(row) if row else None
@@ -1299,6 +1300,99 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Error getting student accounts for class {class_id}: {e}")
             return []
+
+    async def get_student_account_by_roll_number(
+        self,
+        class_id: str,
+        roll_number: str,
+        exclude_account_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Get a student account by class + roll number"""
+        try:
+            normalized_roll = (roll_number or "").strip()
+            if not normalized_roll:
+                return None
+
+            q = (
+                "SELECT * FROM student_accounts "
+                "WHERE class_id = $1 AND LOWER(COALESCE(roll_number, '')) = LOWER($2)"
+            )
+            params: List[Any] = [uuid.UUID(class_id), normalized_roll]
+
+            if exclude_account_id:
+                q += " AND id <> $3"
+                params.append(uuid.UUID(exclude_account_id))
+
+            q += " LIMIT 1"
+
+            async with self.connection() as conn:
+                row = await conn.fetchrow(q, *params)
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting student account by roll number: {e}")
+            return None
+
+    async def get_student_account_by_student_record(
+        self,
+        student_record_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Get account linked to a specific class roster student record"""
+        try:
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    "SELECT * FROM student_accounts WHERE student_record_id = $1 LIMIT 1",
+                    uuid.UUID(student_record_id),
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting student account by student record: {e}")
+            return None
+
+    async def find_student_record_for_account(
+        self,
+        class_id: str,
+        roll_number: Optional[str] = None,
+        student_id: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Find a class roster student record using roll/student_id/email identifiers"""
+        try:
+            identifiers: List[str] = []
+            if roll_number and roll_number.strip():
+                identifiers.append(roll_number.strip())
+            if student_id and student_id.strip() and student_id.strip() not in identifiers:
+                identifiers.append(student_id.strip())
+
+            conditions: List[str] = []
+            params: List[Any] = [uuid.UUID(class_id)]
+            idx = 2
+
+            if identifiers:
+                conditions.append(f"student_id = ANY(${idx}::text[])")
+                params.append(identifiers)
+                idx += 1
+
+            normalized_email = (email or "").strip().lower()
+            if normalized_email:
+                conditions.append(f"LOWER(email) = ${idx}")
+                params.append(normalized_email)
+                idx += 1
+
+            if not conditions:
+                return None
+
+            query = (
+                "SELECT * FROM students WHERE class_id = $1 AND ("
+                + " OR ".join(conditions)
+                + ") ORDER BY created_at DESC LIMIT 1"
+            )
+
+            async with self.connection() as conn:
+                row = await conn.fetchrow(query, *params)
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error finding student record for account in class {class_id}: {e}")
+            return None
 
     async def get_pending_student_accounts(self, class_id: str) -> List[Dict[str, Any]]:
         """Get unverified student accounts for a class"""
@@ -1613,6 +1707,35 @@ class DatabaseService:
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error getting submissions for student {student_account_id}: {e}")
+            return []
+
+    async def get_student_paper_submissions(
+        self,
+        student_record_id: str,
+        class_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get completed paper submissions for a class roster student record"""
+        try:
+            query = """
+                SELECT s.*, p.title AS paper_title, p.total_marks AS paper_total_marks, p.subject_id
+                FROM submissions s
+                LEFT JOIN papers p ON p.id = s.paper_id
+                WHERE s.student_id = $1
+                  AND s.grading_status IN ('completed', 'graded')
+            """
+            params: List[Any] = [uuid.UUID(student_record_id)]
+
+            if class_id:
+                query += " AND (s.class_id = $2 OR p.class_id = $2)"
+                params.append(uuid.UUID(class_id))
+
+            query += " ORDER BY COALESCE(s.graded_at, s.submitted_at, s.created_at) DESC"
+
+            async with self.connection() as conn:
+                rows = await conn.fetch(query, *params)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting paper submissions for student record {student_record_id}: {e}")
             return []
 
     # ==================== Student Scores Operations ====================

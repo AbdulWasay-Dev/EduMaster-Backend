@@ -586,6 +586,8 @@ async def export_paper(
                 _cfg = _j2.loads(_cfg)
             except Exception:
                 _cfg = {}
+        if not isinstance(_cfg, dict):
+            _cfg = {}
 
         paper_meta = {
             "institution_name": _cfg.get("institution_name", "EduMaster Institute"),
@@ -679,7 +681,7 @@ async def get_printable_paper(
             )
         
         # Verify teacher has access
-        if paper["owner_id"] != current_teacher["id"]:
+        if str(paper["owner_id"]) != str(current_teacher["id"]):
             raise HTTPException(
                 status_code=403,
                 detail="Access denied to this paper"
@@ -719,13 +721,41 @@ async def download_answer_key(
             raise HTTPException(status_code=404, detail="Paper not found")
         
         # Check ownership
-        if paper['owner_id'] != current_user['id']:
+        if str(paper['owner_id']) != str(current_user['id']):
             logger.error(f"Access denied for user {current_user['id']} to paper {paper_id}")
             raise HTTPException(status_code=403, detail="Access denied")
         
         # Validate paper has questions and answer key
         questions = paper.get('questions', [])
+        if isinstance(questions, str):
+            import json
+            try:
+                questions = json.loads(questions)
+            except Exception:
+                questions = []
+
         answer_key = paper.get('answer_key', {})
+
+
+        if isinstance(answer_key, str):
+
+
+            try:
+
+
+                import json
+
+
+                answer_key = json.loads(answer_key)
+
+
+            except Exception: answer_key = {}
+        if isinstance(answer_key, str):
+            import json
+            try:
+                answer_key = json.loads(answer_key)
+            except Exception:
+                answer_key = {}
         
         if not questions:
             logger.error(f"Paper {paper_id} has no questions")
@@ -809,7 +839,27 @@ async def download_answer_key(
                 
                 # Organize questions by type
                 questions = paper.get('questions', [])
+
+                if isinstance(questions, str):
+
+                    try:
+
+                        import json
+
+                        questions = json.loads(questions)
+
+                    except Exception: questions = []
                 answer_key = paper.get('answer_key', {})
+
+                if isinstance(answer_key, str):
+
+                    try:
+
+                        import json
+
+                        answer_key = json.loads(answer_key)
+
+                    except Exception: answer_key = {}
                 
                 mcq_questions = [q for q in questions if q.get('question_type') == 'mcq']
                 short_questions = [q for q in questions if q.get('question_type') == 'short_answer']
@@ -938,7 +988,32 @@ async def download_answer_key(
             """
             
             questions = paper.get('questions', [])
+
+            
+            if isinstance(questions, str):
+
+            
+                try:
+
+            
+                    import json
+
+            
+                    questions = json.loads(questions)
+
+            
+                except Exception: questions = []
             answer_key = paper.get('answer_key', {})
+
+            if isinstance(answer_key, str):
+
+                try:
+
+                    import json
+
+                    answer_key = json.loads(answer_key)
+
+                except Exception: answer_key = {}
             
             for i, question in enumerate(questions, 1):
                 question_id = f"q{i}"
@@ -986,7 +1061,35 @@ def _generate_printable_content(paper: dict) -> str:
     
     # Questions
     questions = paper.get('questions', [])
-    for i, question in enumerate(questions, 1):
+    if isinstance(questions, str):
+        import json
+        try:
+            questions = json.loads(questions)
+        except Exception:
+            questions = []
+
+    answer_key = paper.get('answer_key', {})
+
+
+    if isinstance(answer_key, str):
+
+
+        try:
+
+
+            import json
+
+
+            answer_key = json.loads(answer_key)
+
+
+        except Exception: answer_key = {}
+    if isinstance(answer_key, str):
+        import json
+        try:
+            answer_key = json.loads(answer_key)
+        except Exception:
+            answer_key = {}
         content.append(f"\nQ{i}. {question.get('question_text', 'No question text')}")
         
         # Add marks
@@ -1010,6 +1113,21 @@ def _generate_printable_content(paper: dict) -> str:
     content.append("=" * 80)
     
     answer_key = paper.get('answer_key', {})
+
+    
+    if isinstance(answer_key, str):
+
+    
+        try:
+
+    
+            import json
+
+    
+            answer_key = json.loads(answer_key)
+
+    
+        except Exception: answer_key = {}
     for i, question in enumerate(questions, 1):
         question_id = f"q{i}"
         answer = answer_key.get(question_id, "No answer provided")
@@ -1051,6 +1169,21 @@ def _generate_html_paper(paper: dict, printable_content: str) -> str:
     """
     
     questions = paper.get('questions', [])
+
+    
+    if isinstance(questions, str):
+
+    
+        try:
+
+    
+            import json
+
+    
+            questions = json.loads(questions)
+
+    
+        except Exception: questions = []
     for i, question in enumerate(questions, 1):
         html += f"""
             <div class="question">
@@ -1081,6 +1214,21 @@ def _generate_html_paper(paper: dict, printable_content: str) -> str:
     """
     
     answer_key = paper.get('answer_key', {})
+
+    
+    if isinstance(answer_key, str):
+
+    
+        try:
+
+    
+            import json
+
+    
+            answer_key = json.loads(answer_key)
+
+    
+        except Exception: answer_key = {}
     for i, question in enumerate(questions, 1):
         question_id = f"q{i}"
         answer = answer_key.get(question_id, "No answer provided")
@@ -1098,6 +1246,12 @@ def _generate_html_paper(paper: dict, printable_content: str) -> str:
 def _generate_printable_paper_format(paper: dict) -> dict:
     """Generate structured printable format for the paper"""
     questions = paper.get('questions', [])
+    if isinstance(questions, str):
+        try:
+            import json
+            questions = json.loads(questions)
+        except:
+            questions = []
     
     # Calculate statistics
     total_marks = sum(q.get('max_score', 5) for q in questions)
@@ -1384,11 +1538,17 @@ def _build_paper_pdf(
     from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT, TA_JUSTIFY
     from reportlab.lib import colors
     import io
+    import json
 
     buffer = io.BytesIO()
     styles = getSampleStyleSheet()
 
     questions = paper.get("questions", [])
+    if isinstance(questions, str):
+        try:
+            questions = json.loads(questions)
+        except Exception:
+            questions = []
     title = paper.get("title", "Examination Paper")
     total_marks = paper.get("total_marks", 0)
     institution = meta.get("institution_name") or "EduMaster Institute"

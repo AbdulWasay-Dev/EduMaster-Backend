@@ -502,7 +502,7 @@ async def get_student_scores(
         if str(student["class_id"]) not in class_ids:
             raise HTTPException(status_code=403, detail="Access denied")
 
-        scores = await db.get_student_scores({"student_id": student_id})
+        scores = await db.get_student_scores(student_id)
         return scores or []
     except HTTPException:
         raise

@@ -81,6 +81,26 @@ class SubjectItem(BaseModel):
     document_count: int = 0
 
 
+class ClassItem(BaseModel):
+    id: str
+    name: str
+    grade_level: Optional[str] = None
+    academic_year: Optional[str] = None
+    class_code: Optional[str] = None
+    subjects: List[SubjectItem] = []
+
+
+class StudentPaperItem(BaseModel):
+    id: str
+    paper_title: str
+    subject_name: str
+    total_marks: float
+    marks_obtained: float
+    percentage: float
+    grade: Optional[str] = None
+    graded_at: Optional[str] = None
+
+
 # ─── Helpers ───────────────────────────────────────────────────────
 async def _verify_student_class(db, student: dict) -> dict:
     """Get and verify the student's class exists"""
@@ -243,10 +263,15 @@ async def get_student_assignment(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+import json
+import os
+import shutil
+
 @router.post("/assignments/{assignment_id}/submit", response_model=SubmissionResponse)
 async def submit_assignment(
     assignment_id: str,
-    body: SubmissionCreate,
+    submission_text: Optional[str] = Form(None),
+    files: List[UploadFile] = File(None),
     current_student: dict = Depends(require_student()),
 ):
     """Submit an assignment (creates or updates submission)"""
@@ -275,11 +300,25 @@ async def submit_assignment(
             if now > due:
                 raise HTTPException(status_code=400, detail="Submission deadline has passed")
 
+        # Handle file uploads
+        uploaded_files = []
+        if files:
+            os.makedirs("uploads/answer_sheets", exist_ok=True)
+            for f in files:
+                if f.filename:
+                    sanitized_name = f.filename.replace(" ", "_")
+                    file_path = f"uploads/answer_sheets/{student_id}_{assignment_id}_{sanitized_name}"
+                    with open(file_path, "wb") as buffer:
+                        shutil.copyfileobj(f.file, buffer)
+                    uploaded_files.append({"file_name": f.filename, "url": f"/{file_path}"})
+
         # Create / update submission (upsert)
         submission = await db.create_assignment_submission({
             "assignment_id": assignment_id,
             "student_account_id": student_id,
-            "submission_text": body.submission_text,
+            "class_id": str(cls["id"]),
+            "submission_text": submission_text,
+            "submission_files": uploaded_files,
             "status": "submitted",
             "submitted_at": datetime.utcnow().isoformat(),
         })
@@ -367,9 +406,9 @@ async def get_my_scores(current_student: dict = Depends(require_student())):
                 id=str(s["id"]),
                 assignment_title=a.get("title", "Unknown"),
                 subject_name=subj_map.get(str(a.get("subject_id", "")), ""),
-                marks_obtained=s.get("marks_obtained", 0),
+                marks_obtained=float(s.get("marks_obtained") or 0),
                 total_marks=a.get("total_marks", 0),
-                percentage=s.get("percentage", 0),
+                percentage=float(s.get("percentage") or 0),
                 grade=s.get("grade", "N/A"),
                 graded_at=str(s["graded_at"]) if s.get("graded_at") else None,
             ))
@@ -442,6 +481,106 @@ async def get_subject_documents(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@router.get("/subjects/{subject_id}")
+async def get_subject_detail(
+    subject_id: str,
+    current_student: dict = Depends(require_student()),
+):
+    """Get a subject detail summary for the student portal"""
+    try:
+        db = await get_database()
+        cls = await _verify_student_class(db, current_student)
+
+        subjects = await db.get_subjects_by_class(str(cls["id"]))
+        subject = next((s for s in subjects if str(s["id"]) == subject_id), None)
+        if not subject:
+            raise HTTPException(status_code=404, detail="Subject not found")
+
+        docs = await db.get_documents(subject_id)
+        class_assignments = await db.get_assignments_by_class(str(cls["id"]))
+        subject_assignments = [a for a in class_assignments if str(a.get("subject_id")) == subject_id and a.get("status") in ("published", "closed")]
+
+        student_id = str(current_student["id"])
+        submissions = await db.get_student_submissions(student_id)
+        score_history = [s for s in submissions if str(s.get("subject_id", "")) == subject_id and s.get("status") == "graded"]
+
+        return {
+            "id": str(subject["id"]),
+            "name": subject.get("name", ""),
+            "description": subject.get("description"),
+            "document_count": len(docs) if docs else 0,
+            "assignment_count": len(subject_assignments),
+            "average_score": round(sum(float(s.get("percentage") or 0) for s in score_history) / len(score_history), 2) if score_history else None,
+            "documents": [
+                {
+                    "id": str(d["id"]),
+                    "file_name": d.get("file_name", ""),
+                    "file_type": d.get("file_type", ""),
+                    "status": d.get("status", ""),
+                    "created_at": str(d.get("created_at", "")),
+                }
+                for d in (docs or [])
+            ],
+            "assignments": [
+                {
+                    "id": str(a["id"]),
+                    "title": a.get("title", ""),
+                    "due_date": str(a["due_date"]) if a.get("due_date") else None,
+                    "total_marks": a.get("total_marks", 0),
+                    "status": a.get("status", "draft"),
+                }
+                for a in subject_assignments
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get subject detail error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/papers", response_model=List[StudentPaperItem])
+async def get_my_papers(current_student: dict = Depends(require_student())):
+    """Get graded paper submissions for the student's roster record"""
+    try:
+        db = await get_database()
+        cls = await _verify_student_class(db, current_student)
+        student_record = await db.find_student_record_for_account(
+            class_id=str(cls["id"]),
+            roll_number=current_student.get("roll_number"),
+            student_id=current_student.get("student_id"),
+            email=current_student.get("email"),
+        )
+
+        if not student_record:
+            return []
+
+        submissions = await db.get_student_paper_submissions(str(student_record["id"]), str(cls["id"]))
+        subjects = await db.get_subjects_by_class(str(cls["id"]))
+        subject_map = {str(s["id"]): s.get("name", "") for s in subjects}
+
+        result = []
+        for submission in submissions:
+            paper_id = str(submission.get("paper_id"))
+            subject_name = subject_map.get(str(submission.get("subject_id") or ""), "")
+            result.append(StudentPaperItem(
+                id=paper_id,
+                paper_title=submission.get("paper_title", "Paper"),
+                subject_name=subject_name,
+                total_marks=float(submission.get("paper_total_marks") or submission.get("max_score") or 0),
+                marks_obtained=float(submission.get("total_score") or 0),
+                percentage=float(submission.get("grade_percentage") or 0),
+                grade=submission.get("grade"),
+                graded_at=str(submission.get("graded_at")) if submission.get("graded_at") else None,
+            ))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get my papers error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 # ─── RAG Query (Student) ──────────────────────────────────────────
 class StudentRAGQuery(BaseModel):
     question: str
@@ -490,3 +629,104 @@ async def student_rag_query(
     except Exception as e:
         logger.error(f"Student RAG query error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+@router.get("/classes", response_model=List[ClassItem])
+async def get_my_classes(current_student: dict = Depends(require_student())):
+    '''List of enrolled classes - returns a list with the one class the student is in'''
+    db = await get_database()
+    cls = await _verify_student_class(db, current_student)
+
+    subjects = await db.get_subjects_by_class(str(cls["id"]))
+    subject_items = []
+    for subject in subjects:
+        docs = await db.get_documents(str(subject["id"]))
+        subject_items.append({
+            "id": str(subject["id"]),
+            "name": subject.get("name", ""),
+            "description": subject.get("description"),
+            "document_count": len(docs) if docs else 0,
+        })
+    return [{
+        "id": str(cls["id"]),
+        "name": cls.get("name", ""),
+        "grade_level": cls.get("grade_level", ""),
+        "academic_year": cls.get("academic_year", ""),
+        "class_code": cls.get("class_code"),
+        "subjects": subject_items
+    }]
+
+@router.get("/analytics")
+async def get_student_analytics(current_student: dict = Depends(require_student())):
+    '''Returns calculated analytics and historical grade trends'''
+    db = await get_database()
+    student_id = str(current_student["id"])
+
+    submissions = await db.get_student_submissions(student_id)
+    graded = [s for s in submissions if s.get("status") == "graded"]
+
+    assignment_ids = list({str(s.get("assignment_id")) for s in graded if s.get("assignment_id")})
+    assignment_map = {}
+    for assignment_id in assignment_ids:
+        assignment = await db.get_assignment(assignment_id)
+        if assignment:
+            assignment_map[str(assignment["id"])] = assignment
+
+    cls = await _verify_student_class(db, current_student)
+    subjects = await db.get_subjects_by_class(str(cls["id"]))
+    subject_map = {str(s["id"]): s.get("name", "") for s in subjects}
+
+    trend_data = []
+    subject_performance = {}
+    score_values: List[float] = []
+
+    for submission in graded:
+        assignment = assignment_map.get(str(submission.get("assignment_id")))
+        if not assignment:
+            continue
+
+        percentage = float(submission.get("percentage") or 0)
+        score_values.append(percentage)
+        subject_id = str(assignment.get("subject_id") or "")
+
+        trend_data.append({
+            "assignment_id": str(assignment["id"]),
+            "assignment_title": assignment.get("title", "Unknown"),
+            "subject_name": subject_map.get(subject_id, ""),
+            "percentage": percentage,
+            "score": float(submission.get("marks_obtained") or 0),
+            "total_marks": float(assignment.get("total_marks") or 0),
+            "date": str(submission.get("graded_at") or submission.get("submitted_at") or ""),
+        })
+
+        if subject_id:
+            if subject_id not in subject_performance:
+                subject_performance[subject_id] = {
+                    "id": subject_id,
+                    "name": subject_map.get(subject_id, "Unknown"),
+                    "scores": [],
+                }
+            subject_performance[subject_id]["scores"].append(percentage)
+
+    subject_cards = []
+    for subject_id, data in subject_performance.items():
+        scores = data["scores"]
+        subject_cards.append({
+            "id": subject_id,
+            "name": data["name"],
+            "average": round(sum(scores) / len(scores), 2) if scores else 0,
+            "highest": round(max(scores), 2) if scores else 0,
+            "lowest": round(min(scores), 2) if scores else 0,
+            "count": len(scores),
+        })
+
+    overall_percentage = round(sum(score_values) / len(score_values), 2) if score_values else 0
+    recent_trend = trend_data[-5:]
+
+    return {
+        "overall_percentage": overall_percentage,
+        "total_graded": len(graded),
+        "trend": trend_data,
+        "recent_trend": recent_trend,
+        "subject_performance": subject_cards,
+        "pending_assignments": len([a for a in await db.get_assignments_by_class(str(cls["id"])) if a.get("status") == "published"]),
+    }
