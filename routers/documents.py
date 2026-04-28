@@ -4,7 +4,7 @@ Document management API endpoints
 import logging
 import uuid
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
 from pydantic import BaseModel, Field
 
 from utils.security import get_current_teacher, require_teacher
@@ -39,7 +39,6 @@ class DocumentListResponse(BaseModel):
 
 @router.post("/upload", response_model=DocumentResponse)
 async def upload_document(
-    background_tasks: BackgroundTasks,
     subject_id: str = Form(...),
     file: UploadFile = File(...),
     current_user: dict = Depends(require_teacher())
@@ -124,9 +123,8 @@ async def upload_document(
                 detail="Failed to create document record"
             )
         
-        # Process in the background: extract text -> chunk -> embed -> store chunks
-        # This will prevent the API request from timing out on model download/processing.
-        background_tasks.add_task(process_document_async, str(document["id"]))
+        # Process synchronously: extract text -> chunk -> embed -> store chunks
+        await process_document_async(str(document["id"]))
         
         return DocumentResponse(
             id=str(document["id"]),
