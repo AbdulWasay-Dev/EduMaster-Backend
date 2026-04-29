@@ -38,6 +38,6 @@ async def test_endpoint():
 
 if __name__ == "__main__":
     print("🚀 Starting EduMaster Backend...")
-    print("📖 API Documentation: http://localhost:8000/docs")
-    print("🔍 Health Check: http://localhost:8000/health")
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    print("📖 API Documentation: http://localhost:8080/docs")
+    print("🔍 Health Check: http://localhost:8080/health")
+    uvicorn.run(app, host="0.0.0.0", port=8080, reload=True)
