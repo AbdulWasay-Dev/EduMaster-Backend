@@ -6,7 +6,7 @@ import requests
 import json
 import sys
 
-BASE_URL = "http://localhost:8000/api/v1"
+BASE_URL = "http://localhost:8010/api/v1"
 
 def debug_paper_generation():
     """Debug paper generation step by step"""

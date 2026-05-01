@@ -10,7 +10,7 @@ Filter content by chapter titles or keywords.
 
 ```bash
 curl -X 'POST' \
-  'http://localhost:8000/api/v1/papers/generate' \
+  'http://localhost:8010/api/v1/papers/generate' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -29,14 +29,14 @@ Generate questions from specific documents only.
 **Step 1: Get Document List**
 ```bash
 curl -X 'GET' \
-  'http://localhost:8000/api/v1/papers/documents/9949b9f8-1804-4747-9601-fd69c5630344' \
+  'http://localhost:8010/api/v1/papers/documents/9949b9f8-1804-4747-9601-fd69c5630344' \
   -H 'Authorization: Bearer YOUR_TOKEN'
 ```
 
 **Step 2: Use Specific Document IDs**
 ```bash
 curl -X 'POST' \
-  'http://localhost:8000/api/v1/papers/generate' \
+  'http://localhost:8010/api/v1/papers/generate' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -53,7 +53,7 @@ Filter by specific topics or content.
 
 ```bash
 curl -X 'POST' \
-  'http://localhost:8000/api/v1/papers/generate' \
+  'http://localhost:8010/api/v1/papers/generate' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -95,7 +95,7 @@ curl -X 'POST' \
 ```bash
 # Generate questions from "Data Structures" chapter
 curl -X 'POST' \
-  'http://localhost:8000/api/v1/papers/generate' \
+  'http://localhost:8010/api/v1/papers/generate' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -111,7 +111,7 @@ curl -X 'POST' \
 ```bash
 # Focus on specific programming concepts
 curl -X 'POST' \
-  'http://localhost:8000/api/v1/papers/generate' \
+  'http://localhost:8010/api/v1/papers/generate' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -165,7 +165,7 @@ Using your current setup:
 
 ```bash
 curl -X 'POST' \
-  'http://localhost:8000/api/v1/papers/generate' \
+  'http://localhost:8010/api/v1/papers/generate' \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -H 'Content-Type: application/json' \
   -d '{

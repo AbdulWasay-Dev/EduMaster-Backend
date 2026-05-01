@@ -5,6 +5,7 @@ Default model: llama-3.3-70b-versatile (best free model on Groq)
 import json
 import logging
 import asyncio
+import re
 from typing import List, Dict, Any, Optional
 from groq import AsyncGroq
 from config import get_settings
@@ -295,6 +296,378 @@ OUTPUT STRICT JSON ONLY:
         except Exception as e:
             logger.error(f"Error in holistic grading: {e}")
             return None
+
+    async def grade_paper_by_question(
+        self,
+        ocr_text_combined: str,
+        answer_key: Dict[str, Any],
+        questions: List[Dict[str, Any]] | None = None,
+        total_marks: float | int = 100,
+        strictness: str = "medium",
+    ) -> Optional[Dict[str, Any]]:
+        """Grade a full OCR'd paper question-by-question against the answer key."""
+        try:
+            normalized_questions = self._build_grading_questions(questions or [], answer_key or {})
+            if not normalized_questions:
+                logger.warning("No questions available for per-question grading")
+                return None
+
+            resolved_total = float(total_marks or 0)
+            if resolved_total <= 0:
+                resolved_total = sum(float(q.get("max_marks", 0)) for q in normalized_questions)
+            if resolved_total <= 0:
+                resolved_total = 100.0
+
+            def slice_ocr(text: str, head: int, tail: int) -> str:
+                if not text:
+                    return ""
+                text = text.strip()
+                if len(text) <= head + tail + 100:
+                    return text
+                return text[:head] + "\n... [OCR content truncated] ...\n" + text[-tail:]
+
+            q_json = json.dumps(normalized_questions, ensure_ascii=False)
+
+            for head, tail in [(7000, 3000), (4500, 1500), (3000, 800)]:
+                ocr_sliced = slice_ocr(ocr_text_combined, head, tail)
+                prompt = f"""You are an experienced examiner grading a student's scanned answer sheet.
+
+The student's answers were extracted by OCR and may contain handwriting/OCR mistakes.
+Only grade what the student actually wrote in the OCR text. The answer key is for comparison only.
+
+STUDENT_ANSWERS_TEXT:
+{ocr_sliced}
+
+QUESTIONS_AND_ANSWER_KEY_JSON:
+{q_json}
+
+GRADING_RULES:
+- Grade every question independently.
+- Find each student's answer in STUDENT_ANSWERS_TEXT using question numbers, wording, and nearby context.
+- Do not copy, paraphrase, or infer a student answer from the answer key.
+- Do not assume the student attempted a question just because it exists in QUESTIONS_AND_ANSWER_KEY_JSON.
+- Award marks between 0 and each question's max_marks.
+- Use partial credit for short answers, long answers, essays, and fill-in-the-blank responses.
+- For MCQ and true/false, accept clear equivalent answers even if OCR is noisy.
+- If a question is not answered or cannot be found in STUDENT_ANSWERS_TEXT, set student_answer to "", evidence_quote to "", and award 0.
+- For every non-zero score, evidence_quote must be a direct short quote copied from STUDENT_ANSWERS_TEXT that proves the student's answer exists.
+- evidence_quote must include the actual answer words/options the student wrote.
+- evidence_quote must come from the student's written response, not from printed question text, headers, instructions, or repeated answer-key text.
+- If only the printed question appears and no student response follows it, award 0.
+- If there is no direct OCR evidence for an answer, the score must be 0 even if the answer key is obvious.
+- Strictness: {strictness}.
+- Recompute the total from the per-question marks. The paper is out of {resolved_total} marks.
+- Keep comments short and specific.
+
+OUTPUT STRICT JSON ONLY:
+{{
+  "question_details": [
+    {{
+      "question_id": "<same id from input>",
+      "student_answer": "<answer copied/extracted from OCR, or empty string>",
+      "evidence_quote": "<exact short quote from STUDENT_ANSWERS_TEXT proving this answer exists, or empty string>",
+      "marks_awarded": <number>,
+      "max_marks": <number>,
+      "is_correct": <true|false>,
+      "ai_comment": "<short reason for the awarded marks>",
+      "confidence": <0.0-1.0 number>
+    }}
+  ],
+  "overall_feedback": "<2-4 lines of feedback>",
+  "confidence": <0.0-1.0 number>
+}}"""
+
+                resp_text = await self._chat(prompt, max_tokens=4096)
+                if not resp_text:
+                    continue
+
+                parsed = self._parse_question_grading_response(
+                    resp_text=resp_text,
+                    questions=normalized_questions,
+                    total_marks=resolved_total,
+                    ocr_text=ocr_text_combined,
+                )
+                if parsed:
+                    return parsed
+
+            logger.error("Per-question grading failed after all retries")
+            return None
+        except Exception as e:
+            logger.error(f"Error in per-question grading: {e}")
+            return None
+
+    def _build_grading_questions(
+        self,
+        questions: List[Dict[str, Any]],
+        answer_key: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Normalize stored paper questions into the compact shape sent for grading."""
+        normalized: List[Dict[str, Any]] = []
+
+        for index, question in enumerate(questions or [], start=1):
+            if not isinstance(question, dict):
+                continue
+
+            question_id = str(question.get("id") or f"q{index}")
+            max_marks = (
+                question.get("max_marks")
+                or question.get("max_score")
+                or question.get("marks")
+                or 1
+            )
+            try:
+                max_marks = float(max_marks)
+            except (TypeError, ValueError):
+                max_marks = 1.0
+
+            correct_answer = (
+                answer_key.get(question_id)
+                or answer_key.get(str(index))
+                or answer_key.get(f"q{index}")
+                or question.get("correct_answer")
+                or ""
+            )
+
+            normalized.append({
+                "question_id": question_id,
+                "question_number": question.get("question_number") or index,
+                "question_text": question.get("question_text") or question.get("text") or "",
+                "question_type": question.get("question_type") or question.get("type") or "short_answer",
+                "max_marks": max_marks,
+                "correct_answer": correct_answer,
+                "options": question.get("options") or [],
+            })
+
+        if normalized:
+            return normalized
+
+        for index, (question_id, correct_answer) in enumerate((answer_key or {}).items(), start=1):
+            normalized.append({
+                "question_id": str(question_id),
+                "question_number": index,
+                "question_text": "",
+                "question_type": "short_answer",
+                "max_marks": 1.0,
+                "correct_answer": correct_answer,
+                "options": [],
+            })
+
+        return normalized
+
+    def _parse_question_grading_response(
+        self,
+        resp_text: str,
+        questions: List[Dict[str, Any]],
+        total_marks: float,
+        ocr_text: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Parse and normalize per-question grading JSON from the LLM."""
+        try:
+            start_idx = resp_text.find('{')
+            end_idx = resp_text.rfind('}') + 1
+            if start_idx == -1 or end_idx == 0:
+                return None
+
+            data = json.loads(resp_text[start_idx:end_idx])
+            raw_details = data.get("question_details") or data.get("grading_details") or []
+            if not isinstance(raw_details, list):
+                return None
+
+            details_by_id = {
+                str(item.get("question_id")): item
+                for item in raw_details
+                if isinstance(item, dict) and item.get("question_id") is not None
+            }
+
+            normalized_details: List[Dict[str, Any]] = []
+            total_score = 0.0
+
+            for question in questions:
+                question_id = str(question["question_id"])
+                raw = details_by_id.get(question_id, {})
+                max_marks = float(question.get("max_marks", 0) or 0)
+
+                marks_awarded = (
+                    raw.get("marks_awarded")
+                    if isinstance(raw, dict) else 0
+                )
+                if marks_awarded is None and isinstance(raw, dict):
+                    marks_awarded = raw.get("score", raw.get("scored_marks", 0))
+                try:
+                    marks_awarded = float(marks_awarded or 0)
+                except (TypeError, ValueError):
+                    marks_awarded = 0.0
+                student_answer = str(raw.get("student_answer") or raw.get("student_answer_text") or "") if isinstance(raw, dict) else ""
+                evidence_quote = str(raw.get("evidence_quote") or raw.get("ocr_evidence") or "") if isinstance(raw, dict) else ""
+                ai_comment = str(raw.get("ai_comment") or raw.get("ai_feedback") or raw.get("feedback") or "") if isinstance(raw, dict) else ""
+
+                has_answer_evidence = self._has_student_answer_evidence(
+                    ocr_text=ocr_text,
+                    evidence_quote=evidence_quote,
+                    student_answer=student_answer,
+                    question_text=str(question.get("question_text", "")),
+                )
+                if marks_awarded > 0 and (not student_answer.strip() or not has_answer_evidence):
+                    marks_awarded = 0.0
+                    is_missing_reason = "No matching student-answer evidence was found in the OCR text."
+                    ai_comment = f"{ai_comment} {is_missing_reason}".strip() if ai_comment else is_missing_reason
+                marks_awarded = max(0.0, min(marks_awarded, max_marks))
+                total_score += marks_awarded
+
+                confidence = raw.get("confidence", raw.get("ai_confidence", 0.75)) if isinstance(raw, dict) else 0.75
+                try:
+                    confidence = max(0.0, min(float(confidence), 1.0))
+                except (TypeError, ValueError):
+                    confidence = 0.75
+
+                is_correct = raw.get("is_correct") if isinstance(raw, dict) else None
+                if is_correct is None:
+                    is_correct = max_marks > 0 and marks_awarded >= max_marks
+                if marks_awarded == 0:
+                    is_correct = False
+
+                normalized_details.append({
+                    "question_id": question_id,
+                    "question_text": question.get("question_text", ""),
+                    "question_type": question.get("question_type", "short_answer"),
+                    "student_answer": student_answer,
+                    "student_answer_text": student_answer,
+                    "evidence_quote": evidence_quote if has_answer_evidence else "",
+                    "correct_answer": question.get("correct_answer", ""),
+                    "marks_awarded": marks_awarded,
+                    "scored_marks": marks_awarded,
+                    "max_marks": max_marks,
+                    "score": marks_awarded,
+                    "max_score": max_marks,
+                    "is_correct": bool(is_correct),
+                    "ai_comment": ai_comment,
+                    "ai_feedback": ai_comment,
+                    "confidence": confidence,
+                    "ai_confidence": confidence,
+                    "evidence_found": has_answer_evidence,
+                })
+
+            grade_percentage = (total_score / total_marks) * 100 if total_marks > 0 else 0.0
+            overall_confidence = data.get("confidence", 0.75)
+            try:
+                overall_confidence = max(0.0, min(float(overall_confidence), 1.0))
+            except (TypeError, ValueError):
+                overall_confidence = 0.75
+
+            return {
+                "total_score": round(total_score, 2),
+                "max_score": round(total_marks, 2),
+                "grade_percentage": round(grade_percentage, 2),
+                "overall_feedback": str(data.get("overall_feedback") or data.get("feedback") or ""),
+                "confidence": overall_confidence,
+                "question_details": normalized_details,
+            }
+        except Exception as e:
+            logger.error(f"Error parsing per-question grading result: {e}")
+            return None
+
+    def _has_ocr_evidence(self, ocr_text: str, evidence_quote: str) -> bool:
+        """Return true only when a direct evidence quote appears in the OCR text."""
+        if not ocr_text or not evidence_quote:
+            return False
+
+        normalized_ocr = self._normalize_evidence_text(ocr_text)
+        normalized_quote = self._normalize_evidence_text(evidence_quote)
+
+        if len(normalized_quote) < 3:
+            return False
+        if normalized_quote in normalized_ocr:
+            return True
+
+        # Allow short OCR spacing/punctuation drift, but require enough overlap to
+        # avoid accepting answers copied from the answer key.
+        quote_words = normalized_quote.split()
+        if len(quote_words) <= 2:
+            return False
+
+        window_size = min(len(quote_words), 8)
+        for start in range(0, len(quote_words) - window_size + 1):
+            window = " ".join(quote_words[start:start + window_size])
+            if len(window) >= 12 and window in normalized_ocr:
+                return True
+
+        return False
+
+    def _has_student_answer_evidence(
+        self,
+        ocr_text: str,
+        evidence_quote: str,
+        student_answer: str,
+        question_text: str,
+    ) -> bool:
+        """Require OCR evidence that supports the extracted student answer itself."""
+        if not self._has_ocr_evidence(ocr_text, evidence_quote):
+            return False
+
+        normalized_quote = self._normalize_evidence_text(evidence_quote)
+        normalized_answer = self._normalize_evidence_text(student_answer)
+        normalized_question = self._normalize_evidence_text(question_text)
+
+        if not normalized_answer:
+            return False
+
+        if self._quote_is_question_only(normalized_quote, normalized_question, normalized_answer):
+            return False
+
+        return self._answer_supported_by_text(normalized_answer, normalized_quote)
+
+    def _quote_is_question_only(self, quote: str, question: str, answer: str) -> bool:
+        if not quote or not question:
+            return False
+
+        quote_tokens = self._meaningful_tokens(quote)
+        question_tokens = set(self._meaningful_tokens(question))
+        answer_tokens = set(self._meaningful_tokens(answer))
+
+        if not quote_tokens or not question_tokens:
+            return False
+
+        question_hits = sum(1 for token in quote_tokens if token in question_tokens)
+        answer_hits = sum(1 for token in quote_tokens if token in answer_tokens)
+
+        question_ratio = question_hits / max(len(quote_tokens), 1)
+        answer_ratio = answer_hits / max(len(answer_tokens), 1) if answer_tokens else 0.0
+
+        return question_ratio >= 0.75 and answer_ratio < 0.5
+
+    def _answer_supported_by_text(self, answer: str, text: str) -> bool:
+        if not answer or not text:
+            return False
+
+        if len(answer) >= 3 and answer in text:
+            return True
+
+        answer_tokens = self._meaningful_tokens(answer)
+        text_tokens = set(self._meaningful_tokens(text))
+        if not answer_tokens or not text_tokens:
+            return False
+
+        if len(answer_tokens) == 1:
+            token = answer_tokens[0]
+            return len(token) >= 3 and token in text_tokens
+
+        hits = sum(1 for token in answer_tokens if token in text_tokens)
+        required_ratio = 1.0 if len(answer_tokens) <= 3 else 0.7
+        return (hits / len(answer_tokens)) >= required_ratio
+
+    def _meaningful_tokens(self, value: str) -> List[str]:
+        stop_words = {
+            "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+            "in", "is", "it", "of", "on", "or", "the", "to", "was", "were",
+            "what", "when", "where", "which", "who", "why", "how", "define",
+            "explain", "describe", "question", "q",
+        }
+        return [token for token in value.split() if token not in stop_words]
+
+    def _normalize_evidence_text(self, value: str) -> str:
+        value = value.lower()
+        value = re.sub(r"[^a-z0-9]+", " ", value)
+        return " ".join(value.split())
     
     def _create_rag_prompt(self, question: str, context: str, question_type: str) -> str:
         """Create prompt for RAG answer generation"""

@@ -5,7 +5,7 @@ Quick test for paper generation
 import requests
 import json
 
-BASE_URL = "http://localhost:8000/api/v1"
+BASE_URL = "http://localhost:8010/api/v1"
 
 def quick_test():
     """Quick test of paper generation"""

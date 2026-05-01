@@ -32,7 +32,7 @@ class AnswerSheetGradingService:
     async def process_multiple_answer_sheets(
         self,
         paper_id: str,
-        student_id: str,
+        student_id: Optional[str],
         answer_sheet_images: List[str],  # List of base64 encoded images
         grading_mode: str = "auto",
         strictness: str = "medium"
@@ -65,47 +65,72 @@ class AnswerSheetGradingService:
             if not paper:
                 raise ValueError("Paper not found")
             
-            # Holistic grading: send combined OCR and answer key to LLM
-            total_marks = paper.get("total_marks", sum(q.get("max_score", 5) for q in paper["questions"]))
-            holistic = await self.llm_service.grade_paper_holistic(
+            # Per-question grading: send combined OCR, questions, and answer key to the LLM.
+            total_marks = self._resolve_total_marks(paper)
+            grading_result = await self.llm_service.grade_paper_by_question(
                 ocr_text_combined=combined_text,
                 answer_key=paper.get("answer_key", {}),
                 questions=paper.get("questions", []),
                 total_marks=total_marks,
+                strictness=strictness,
             )
-            if not holistic:
-                raise ValueError("Holistic grading failed")
+            if not grading_result:
+                raise ValueError("Per-question grading failed")
             
             # Ensure database is initialized
             if self.db is None:
                 self.db = await get_database()
             
             # Lookup student to populate required denormalized fields (e.g., student_name)
-            student = await self.db.get_student(student_id)
-            student_name = (student or {}).get("student_name") or (student or {}).get("name") or ""
-            
+            student_name = ""
+            if student_id:
+                student = await self.db.get_student(student_id)
+                student_name = (student or {}).get("student_name") or (student or {}).get("name") or ""
+
+            question_details = grading_result.get("question_details", [])
+            stored_submission_data = self._build_stored_submission_data(
+                grading_result=grading_result,
+                total_marks=total_marks,
+                question_details=question_details,
+                ocr_confidence=combined_result.get("overall_confidence", 0.75),
+                images_processed=len(answer_sheet_images),
+                grading_mode=grading_mode,
+                strictness=strictness,
+            )
+
             # Create submission record
             submission_data = {
                 "paper_id": paper_id,
                 "student_id": student_id,
                 "student_name": student_name,
                 "ocr_text": combined_text,
-                "total_score": holistic["total_score"],
-                "grade_percentage": holistic["grade_percentage"],
-                "feedback": holistic["overall_feedback"],
+                "submission_data": stored_submission_data,
+                "total_score": grading_result["total_score"],
+                "grade_percentage": grading_result["grade_percentage"],
+                "feedback": grading_result["overall_feedback"],
                 "grading_status": "completed",
                 "images_processed": len(answer_sheet_images),
                 "ocr_confidence": combined_result.get("overall_confidence", 0.75)
             }
             
             submission = await self.db.create_submission(submission_data)
+            if not submission:
+                raise ValueError("Failed to save graded submission")
             
             return {
                 "submission_id": submission["id"],
-                "total_score": holistic["total_score"],
-                "grade_percentage": holistic["grade_percentage"],
-                "feedback": holistic["overall_feedback"],
-                "confidence_score": holistic.get("confidence", 0.75),
+                "total_score": grading_result["total_score"],
+                "score": grading_result["total_score"],
+                "max_score": total_marks,
+                "total_marks": total_marks,
+                "grade_percentage": grading_result["grade_percentage"],
+                "grade": self._grade_label(grading_result["grade_percentage"]),
+                "feedback": grading_result["overall_feedback"],
+                "ai_feedback": grading_result["overall_feedback"],
+                "question_scores": question_details,
+                "question_details": question_details,
+                "grading_details": question_details,
+                "confidence_score": grading_result.get("confidence", 0.75),
                 "images_processed": len(answer_sheet_images),
                 "ocr_confidence": combined_result.get("overall_confidence", 0.75)
             }
@@ -117,7 +142,7 @@ class AnswerSheetGradingService:
     async def process_answer_sheet(
         self, 
         paper_id: str,
-        student_id: str,
+        student_id: Optional[str],
         answer_sheet_image: str,  # Base64 encoded image
         grading_mode: str = "auto",
         strictness: str = "medium"
@@ -141,47 +166,72 @@ class AnswerSheetGradingService:
             if not paper:
                 raise ValueError("Paper not found")
             
-            # Holistic grading: single image text + answer key
-            total_marks = paper.get("total_marks", sum(q.get("max_score", 5) for q in paper["questions"]))
-            holistic = await self.llm_service.grade_paper_holistic(
+            # Per-question grading: single image OCR + answer key
+            total_marks = self._resolve_total_marks(paper)
+            grading_result = await self.llm_service.grade_paper_by_question(
                 ocr_text_combined=ocr_text,
                 answer_key=paper.get("answer_key", {}),
                 questions=paper.get("questions", []),
                 total_marks=total_marks,
+                strictness=strictness,
             )
-            if not holistic:
-                raise ValueError("Holistic grading failed")
+            if not grading_result:
+                raise ValueError("Per-question grading failed")
             
             # Ensure database is initialized
             if self.db is None:
                 self.db = await get_database()
             
             # Lookup student to populate required denormalized fields (e.g., student_name)
-            student = await self.db.get_student(student_id)
-            student_name = (student or {}).get("student_name") or (student or {}).get("name") or ""
-            
+            student_name = ""
+            if student_id:
+                student = await self.db.get_student(student_id)
+                student_name = (student or {}).get("student_name") or (student or {}).get("name") or ""
+
+            question_details = grading_result.get("question_details", [])
+            stored_submission_data = self._build_stored_submission_data(
+                grading_result=grading_result,
+                total_marks=total_marks,
+                question_details=question_details,
+                ocr_confidence=ocr_confidence,
+                images_processed=1,
+                grading_mode=grading_mode,
+                strictness=strictness,
+            )
+
             # Create submission record
             submission_data = {
                 "paper_id": paper_id,
                 "student_id": student_id,
                 "student_name": student_name,
                 "ocr_text": ocr_text,
-                "total_score": holistic["total_score"],
-                "grade_percentage": holistic["grade_percentage"],
-                "feedback": holistic["overall_feedback"],
+                "submission_data": stored_submission_data,
+                "total_score": grading_result["total_score"],
+                "grade_percentage": grading_result["grade_percentage"],
+                "feedback": grading_result["overall_feedback"],
                 "grading_status": "completed",
                 "images_processed": 1,
                 "ocr_confidence": ocr_confidence
             }
             
             submission = await self.db.create_submission(submission_data)
+            if not submission:
+                raise ValueError("Failed to save graded submission")
             
             return {
                 "submission_id": submission["id"],
-                "total_score": holistic["total_score"],
-                "grade_percentage": holistic["grade_percentage"],
-                "feedback": holistic["overall_feedback"],
-                "confidence_score": holistic.get("confidence", 0.75),
+                "total_score": grading_result["total_score"],
+                "score": grading_result["total_score"],
+                "max_score": total_marks,
+                "total_marks": total_marks,
+                "grade_percentage": grading_result["grade_percentage"],
+                "grade": self._grade_label(grading_result["grade_percentage"]),
+                "feedback": grading_result["overall_feedback"],
+                "ai_feedback": grading_result["overall_feedback"],
+                "question_scores": question_details,
+                "question_details": question_details,
+                "grading_details": question_details,
+                "confidence_score": grading_result.get("confidence", 0.75),
                 "images_processed": 1,
                 "ocr_confidence": ocr_confidence
             }
@@ -257,12 +307,23 @@ class AnswerSheetGradingService:
                 logger.error(f"Paper {paper_id} not found in database")
                 return None
 
-            # Ensure required fields exist
+            # Ensure required fields exist and are decoded
+            import json as _json
             questions = paper.get("questions", []) or []
+            if isinstance(questions, str):
+                try:
+                    questions = _json.loads(questions) or []
+                except Exception:
+                    questions = []
             answer_key = paper.get("answer_key", {}) or {}
+            if isinstance(answer_key, str):
+                try:
+                    answer_key = _json.loads(answer_key) or {}
+                except Exception:
+                    answer_key = {}
             total_marks = paper.get("total_marks")
             if total_marks is None:
-                total_marks = sum(q.get("max_score", 5) for q in questions)
+                total_marks = sum((q.get("max_score", 5) if isinstance(q, dict) else 0) for q in questions)
 
             # Warn if empty
             if not questions:
@@ -279,6 +340,76 @@ class AnswerSheetGradingService:
         except Exception as e:
             logger.error(f"Error getting paper details: {e}")
             return None
+
+    def _resolve_total_marks(self, paper: Dict[str, Any]) -> float:
+        """Resolve paper max marks from stored total or question marks."""
+        total_marks = paper.get("total_marks")
+        try:
+            total_marks = float(total_marks or 0)
+        except (TypeError, ValueError):
+            total_marks = 0.0
+
+        if total_marks > 0:
+            return total_marks
+
+        total = 0.0
+        for question in paper.get("questions", []) or []:
+            if not isinstance(question, dict):
+                continue
+            marks = question.get("max_marks") or question.get("max_score") or question.get("marks") or 0
+            try:
+                total += float(marks or 0)
+            except (TypeError, ValueError):
+                continue
+        return total or 100.0
+
+    def _build_stored_submission_data(
+        self,
+        grading_result: Dict[str, Any],
+        total_marks: float,
+        question_details: List[Dict[str, Any]],
+        ocr_confidence: float,
+        images_processed: int,
+        grading_mode: str,
+        strictness: str,
+    ) -> Dict[str, Any]:
+        """Build the JSON blob used by serializers and result pages."""
+        return {
+            "score": grading_result.get("total_score", 0),
+            "total_score": grading_result.get("total_score", 0),
+            "max_score": total_marks,
+            "total_marks": total_marks,
+            "grade_percentage": grading_result.get("grade_percentage", 0),
+            "grade": self._grade_label(grading_result.get("grade_percentage", 0)),
+            "feedback": grading_result.get("overall_feedback", ""),
+            "ai_feedback": grading_result.get("overall_feedback", ""),
+            "question_details": question_details,
+            "grading_details": question_details,
+            "ocr_confidence": ocr_confidence,
+            "images_processed": images_processed,
+            "grading_mode": grading_mode,
+            "strictness": strictness,
+            "grading_method": "llm_per_question",
+            "confidence_score": grading_result.get("confidence", 0.75),
+        }
+
+    def _grade_label(self, percentage: float) -> str:
+        """Convert a percentage into the label used by the frontend."""
+        try:
+            pct = float(percentage or 0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        if pct >= 90:
+            return "A+"
+        if pct >= 80:
+            return "A"
+        if pct >= 70:
+            return "B"
+        if pct >= 60:
+            return "C"
+        if pct >= 50:
+            return "D"
+        return "F"
     
     def _parse_student_answers(self, ocr_text: str, questions: List[Dict[str, Any]]) -> Dict[str, str]:
         """Parse student answers from OCR text"""

@@ -50,7 +50,8 @@ ENVIRONMENT=development
 SECRET_KEY={secret_key}
 
 # API Configuration
-CORS_ORIGINS=["http://localhost:3000", "http://localhost:8080"]
+PORT=8010
+CORS_ORIGINS=["http://localhost:5174", "http://127.0.0.1:5174"]
 
 # Supabase Configuration
 SUPABASE_URL={supabase_url or 'https://your-project.supabase.co'}
@@ -135,7 +136,7 @@ def main():
         print("\n🎉 Environment setup completed!")
         print("\n📋 Next steps:")
         print("1. Restart the server: python main.py")
-        print("2. Test the endpoints at: http://localhost:8000/docs")
+        print("2. Test the endpoints at: http://localhost:8010/docs")
         print("3. Try uploading documents and using RAG features")
         
         # Ask if user wants to test connections

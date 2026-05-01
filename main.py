@@ -57,8 +57,8 @@ app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
     description="Educational RAG System with AI-powered question generation and grading",
-    docs_url="/docs" if settings.debug else None,
-    redoc_url="/redoc" if settings.debug else None,
+    docs_url="/docs" if settings.debug or settings.environment == "development" else None,
+    redoc_url="/redoc" if settings.debug or settings.environment == "development" else None,
     lifespan=lifespan
 )
 
@@ -225,15 +225,9 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8080,
-        reload=settings.debug,
-        reload_excludes=[
-            "*.git*",
-            "*__pycache__*",
-            "*.pyc",
-            "chroma_db/*",
-            "uploads/*",
-            "*.log",
-        ],
+        port=settings.port,
+        # Keep direct local startup stable. ChromaDB writes SQLite files during
+        # startup/use, which can trigger reload loops on Windows.
+        reload=False,
         log_level="info" if not settings.debug else "debug"
     )

@@ -1,9 +1,10 @@
 """
 Paper Management API endpoints
 """
+import json
 import logging
 import uuid
-from typing import List, Optional, Dict
+from typing import Any, List, Optional, Dict
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from pydantic import BaseModel, Field
 
@@ -37,13 +38,15 @@ class PaperGenerationRequest(BaseModel):
 
     # Advanced paper configuration
     question_type_counts: Optional[Dict[str, int]] = Field(None, description="Per-type question counts e.g. {'mcq': 5, 'short_answer': 3, 'essay': 2}")
-    template: str = Field(default="classic", description="Paper template: classic, university, school, minimalist")
+    template: Optional[str] = Field(default=None, description="Paper template: classic, university, school, minimalist")
     institution_name: Optional[str] = Field(None, description="Institution / school name for the paper header")
+    teacher_name: Optional[str] = Field(None, description="Teacher name displayed on the paper")
     course_name: Optional[str] = Field(None, description="Course name displayed on the paper")
     exam_date: Optional[str] = Field(None, description="Exam date displayed on the paper")
     duration: Optional[str] = Field(None, description="Duration string e.g. '3 Hours'")
     instructions: Optional[str] = Field(None, description="Custom paper instructions")
-    student_fields: Optional[List[str]] = Field(default=["name", "roll_number"], description="Student detail fields to show on paper")
+    student_fields: Optional[List[str]] = Field(default=None, description="Student detail fields to show on paper")
+    topic_focus: Optional[str] = Field(None, description="Topic focus alias used by the frontend")
 
 
 class PaperFromSheetRequest(BaseModel):
@@ -72,11 +75,42 @@ class PaperResponse(BaseModel):
     difficulty_level: str = "medium"
     template: str = "classic"
     institution_name: Optional[str] = None
+    teacher_name: Optional[str] = None
     course_name: Optional[str] = None
     exam_date: Optional[str] = None
     duration: Optional[str] = None
     instructions: Optional[str] = None
     student_fields: Optional[List[str]] = None
+
+
+def _parse_string_list(value: Any, fallback: Optional[List[str]] = None) -> List[str]:
+    fallback = fallback or ["name", "roll_number"]
+    if isinstance(value, list):
+        parsed = [str(item) for item in value if item]
+        return parsed or fallback
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+            if isinstance(decoded, list):
+                parsed = [str(item) for item in decoded if item]
+                return parsed or fallback
+        except Exception:
+            pass
+    return fallback
+
+
+def _teacher_paper_defaults(teacher: Optional[dict], subject_name: str = "") -> dict:
+    teacher = teacher or {}
+    return {
+        "template": teacher.get("default_paper_template") or "classic",
+        "institution_name": teacher.get("school_name") or "EduMaster Institute",
+        "teacher_name": teacher.get("name") or "Unknown Teacher",
+        "course_name": teacher.get("default_course_name") or subject_name,
+        "duration": teacher.get("default_exam_duration") or "3 Hours",
+        "instructions": teacher.get("default_exam_instructions")
+            or "Answer ALL questions. Marks are indicated against each question.",
+        "student_fields": _parse_string_list(teacher.get("default_student_fields")),
+    }
 
 
 @router.post("/generate", response_model=PaperResponse)
@@ -117,6 +151,7 @@ async def generate_paper(
         # Use RAG system to retrieve comprehensive content
         # Create a more specific query based on the subject and paper requirements
         subject_name = "the subject"  # We'll try to get this from the subject data
+        subject_data = None
         try:
             # Try to get subject name for better query
             subject_data = await db.get_subject(request.subject_id)
@@ -158,7 +193,8 @@ async def generate_paper(
                 logger.error(f"Direct query also failed: {e}")
         
         # Apply chapter/content filtering if specified
-        if relevant_chunks and (request.chapter_keywords or request.content_filter):
+        content_filter = request.content_filter or request.topic_focus
+        if relevant_chunks and (request.chapter_keywords or content_filter):
             filtered_chunks = []
             
             for chunk in relevant_chunks:
@@ -171,8 +207,8 @@ async def generate_paper(
                         continue
                 
                 # Filter by content filter
-                if request.content_filter:
-                    if request.content_filter.lower() in chunk_text:
+                if content_filter:
+                    if content_filter.lower() in chunk_text:
                         filtered_chunks.append(chunk)
                         continue
             
@@ -271,6 +307,15 @@ async def generate_paper(
             answer_key[question_id] = question.get("correct_answer", "")
             total_marks += question.get("marks", question.get("max_score", 5))
         
+        teacher_defaults = _teacher_paper_defaults(current_teacher, subject_name)
+        resolved_template = request.template or teacher_defaults["template"]
+        resolved_student_fields = request.student_fields or teacher_defaults["student_fields"]
+        resolved_institution = request.institution_name or teacher_defaults["institution_name"]
+        resolved_teacher_name = request.teacher_name or teacher_defaults["teacher_name"]
+        resolved_course = request.course_name or teacher_defaults["course_name"]
+        resolved_duration = request.duration or teacher_defaults["duration"]
+        resolved_instructions = request.instructions or teacher_defaults["instructions"]
+
         # Create paper record
         paper_data = {
             "id": str(uuid.uuid4()),
@@ -286,14 +331,22 @@ async def generate_paper(
                 "question_types": resolved_types,
                 "difficulty_level": request.difficulty_level,
                 "time_limit": request.time_limit,
-                "template": request.template,
-                "institution_name": request.institution_name,
-                "course_name": request.course_name,
+                "template": resolved_template,
+                "institution_name": resolved_institution,
+                "teacher_name": resolved_teacher_name,
+                "course_name": resolved_course,
                 "exam_date": request.exam_date,
-                "duration": request.duration,
-                "instructions": request.instructions,
-                "student_fields": request.student_fields or ["name", "roll_number"],
+                "duration": resolved_duration,
+                "instructions": resolved_instructions,
+                "student_fields": resolved_student_fields,
                 "question_type_counts": request.question_type_counts,
+                "teacher_profile": {
+                    "teacher_name": resolved_teacher_name,
+                    "department": current_teacher.get("department"),
+                    "designation": current_teacher.get("designation"),
+                    "institution_type": current_teacher.get("institution_type"),
+                    "institution_level": current_teacher.get("institution_level"),
+                },
             },
             "is_published": False
         }
@@ -429,6 +482,14 @@ async def create_paper_from_question_sheet(
             question_id = question.get("id", f"q{question.get('question_number', 1)}")
             answer_key[question_id] = question.get("correct_answer", "")
             total_marks += question.get("max_score", 5)
+
+        subject_name = ""
+        try:
+            subject_data = await db.get_subject(request.subject_id)
+            subject_name = subject_data.get("name", "") if subject_data else ""
+        except Exception:
+            subject_name = ""
+        teacher_defaults = _teacher_paper_defaults(current_teacher, subject_name)
         
         # Create paper record
         paper_data = {
@@ -443,7 +504,21 @@ async def create_paper_from_question_sheet(
             "total_marks": total_marks,
             "configuration": {
                 "source": "question_sheet",
-                "ocr_text": ocr_text
+                "ocr_text": ocr_text,
+                "template": teacher_defaults["template"],
+                "institution_name": teacher_defaults["institution_name"],
+                "teacher_name": teacher_defaults["teacher_name"],
+                "course_name": teacher_defaults["course_name"],
+                "duration": teacher_defaults["duration"],
+                "instructions": teacher_defaults["instructions"],
+                "student_fields": teacher_defaults["student_fields"],
+                "teacher_profile": {
+                    "teacher_name": teacher_defaults["teacher_name"],
+                    "department": current_teacher.get("department"),
+                    "designation": current_teacher.get("designation"),
+                    "institution_type": current_teacher.get("institution_type"),
+                    "institution_level": current_teacher.get("institution_level"),
+                },
             },
             "is_published": False
         }
@@ -487,7 +562,7 @@ async def preview_paper(
             )
         
         # Verify teacher has access
-        if paper["owner_id"] != current_teacher["id"]:
+        if str(paper["owner_id"]) != str(current_teacher["id"]):
             raise HTTPException(
                 status_code=403,
                 detail="Access denied to this paper"
@@ -525,7 +600,7 @@ async def publish_paper(
             )
         
         # Verify teacher has access
-        if paper["owner_id"] != current_teacher["id"]:
+        if str(paper["owner_id"]) != str(current_teacher["id"]):
             raise HTTPException(
                 status_code=403,
                 detail="Access denied to this paper"
@@ -578,6 +653,11 @@ async def export_paper(
         if str(paper["owner_id"]) != str(current_teacher["id"]):
             raise HTTPException(status_code=403, detail="Access denied to this paper")
 
+        paper = _normalize_paper_row(paper)
+
+        teacher_info = await db.get_teacher(str(paper["owner_id"]))
+        teacher_defaults = _teacher_paper_defaults(teacher_info)
+
         # Extract metadata from configuration
         _cfg = paper.get("configuration") or {}
         if isinstance(_cfg, str):
@@ -588,15 +668,16 @@ async def export_paper(
                 _cfg = {}
 
         paper_meta = {
-            "institution_name": _cfg.get("institution_name", "EduMaster Institute"),
-            "course_name": _cfg.get("course_name", ""),
+            "institution_name": _cfg.get("institution_name") or teacher_defaults["institution_name"],
+            "teacher_name": _cfg.get("teacher_name") or teacher_defaults["teacher_name"],
+            "course_name": _cfg.get("course_name") or teacher_defaults["course_name"],
             "exam_date": _cfg.get("exam_date", "________________"),
-            "duration": _cfg.get("duration", "3 Hours"),
-            "instructions": _cfg.get("instructions", ""),
-            "student_fields": _cfg.get("student_fields", ["name", "roll_number"]),
+            "duration": _cfg.get("duration") or teacher_defaults["duration"],
+            "instructions": _cfg.get("instructions") or teacher_defaults["instructions"],
+            "student_fields": _cfg.get("student_fields") or teacher_defaults["student_fields"],
         }
         # Template: query param overrides stored config
-        resolved_template = template_name or _cfg.get("template", "classic")
+        resolved_template = template_name or _cfg.get("template") or teacher_defaults["template"]
 
         # Generate printable content (text fallback)
         printable_content = _generate_printable_content(paper)
@@ -608,8 +689,7 @@ async def export_paper(
                 class_info = None
                 if subject_info and subject_info.get('class_id'):
                     class_info = await db.get_class(str(subject_info['class_id']))
-                teacher_info = await db.get_teacher(str(paper['owner_id']))
-                teacher_name = teacher_info.get('name', 'Unknown Teacher') if teacher_info else 'Unknown Teacher'
+                teacher_name = paper_meta["teacher_name"]
                 subject_name = subject_info.get('name', 'Unknown Subject') if subject_info else 'Unknown Subject'
                 class_name = class_info.get('name', '') if class_info else ''
 
@@ -679,11 +759,13 @@ async def get_printable_paper(
             )
         
         # Verify teacher has access
-        if paper["owner_id"] != current_teacher["id"]:
+        if str(paper["owner_id"]) != str(current_teacher["id"]):
             raise HTTPException(
                 status_code=403,
                 detail="Access denied to this paper"
             )
+
+        paper = _normalize_paper_row(paper)
         
         # Generate printable format
         printable_paper = _generate_printable_paper_format(paper)
@@ -719,9 +801,11 @@ async def download_answer_key(
             raise HTTPException(status_code=404, detail="Paper not found")
         
         # Check ownership
-        if paper['owner_id'] != current_user['id']:
+        if str(paper['owner_id']) != str(current_user['id']):
             logger.error(f"Access denied for user {current_user['id']} to paper {paper_id}")
             raise HTTPException(status_code=403, detail="Access denied")
+
+        paper = _normalize_paper_row(paper)
         
         # Validate paper has questions and answer key
         questions = paper.get('questions', [])
@@ -734,6 +818,16 @@ async def download_answer_key(
         if not answer_key:
             logger.error(f"Paper {paper_id} has no answer key")
             raise HTTPException(status_code=400, detail="Paper has no answer key")
+
+        cfg = paper.get("configuration") or {}
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg)
+            except Exception:
+                cfg = {}
+        teacher_defaults = _teacher_paper_defaults(current_user)
+        institution_name = cfg.get("institution_name") or teacher_defaults["institution_name"]
+        teacher_name = cfg.get("teacher_name") or teacher_defaults["teacher_name"]
         
         if format.lower() == "pdf":
             # Generate PDF answer key
@@ -753,11 +847,10 @@ async def download_answer_key(
                 except Exception as e:
                     logger.warning(f"Could not get subject info: {e}")
                 
-                teacher_name = "Unknown Teacher"
                 try:
                     teacher_info = await db.get_teacher(str(paper['owner_id']))
                     if teacher_info:
-                        teacher_name = teacher_info.get('name', 'Unknown Teacher')
+                        teacher_name = cfg.get("teacher_name") or teacher_info.get('name', teacher_name)
                 except Exception as e:
                     logger.warning(f"Could not get teacher info: {e}")
                 
@@ -801,6 +894,7 @@ async def download_answer_key(
                 
                 # Header
                 story.append(Paragraph("ANSWER KEY", title_style))
+                story.append(Paragraph(institution_name, styles['Normal']))
                 story.append(Paragraph(f"Paper: {paper.get('title', 'Untitled Paper')}", styles['Normal']))
                 story.append(Paragraph(f"Subject: {subject_info.get('name', 'Unknown Subject') if subject_info else 'Unknown Subject'}", styles['Normal']))
                 story.append(Paragraph(f"Teacher: {teacher_name}", styles['Normal']))
@@ -896,6 +990,8 @@ async def download_answer_key(
         if format.lower() == "txt":
             # Generate text answer key
             content = f"ANSWER KEY\n"
+            content += f"Institution: {institution_name}\n"
+            content += f"Teacher: {teacher_name}\n"
             content += f"Paper: {paper.get('title', 'Untitled Paper')}\n"
             content += f"Total Marks: {paper.get('total_marks', 0)}\n"
             content += "="*50 + "\n\n"
@@ -932,6 +1028,8 @@ async def download_answer_key(
             <body>
                 <div class="header">
                     <h1>ANSWER KEY</h1>
+                    <p>{institution_name}</p>
+                    <p>Teacher: {teacher_name}</p>
                     <p>Paper: {paper.get('title', 'Untitled Paper')}</p>
                     <p>Total Marks: {paper.get('total_marks', 0)}</p>
                 </div>
@@ -971,9 +1069,17 @@ async def download_answer_key(
 def _generate_printable_content(paper: dict) -> str:
     """Generate printable text content for the paper"""
     content = []
+    cfg = paper.get("configuration") or {}
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg)
+        except Exception:
+            cfg = {}
     
     # Header
     content.append("=" * 80)
+    if cfg.get("institution_name"):
+        content.append(str(cfg["institution_name"]).upper())
     content.append(f"QUESTION PAPER: {paper['title']}")
     content.append("=" * 80)
     
@@ -981,6 +1087,13 @@ def _generate_printable_content(paper: dict) -> str:
         content.append(f"\nDescription: {paper['description']}")
     
     content.append(f"Total Marks: {paper.get('total_marks', 0)}")
+    teacher_name = cfg.get("teacher_name") or (cfg.get("teacher_profile") or {}).get("teacher_name")
+    if teacher_name:
+        content.append(f"Teacher: {teacher_name}")
+    if cfg.get("course_name"):
+        content.append(f"Course: {cfg['course_name']}")
+    if cfg.get("duration"):
+        content.append(f"Duration: {cfg['duration']}")
     content.append(f"Created: {paper.get('created_at', 'Unknown')}")
     content.append("\n" + "=" * 80)
     
@@ -1020,6 +1133,16 @@ def _generate_printable_content(paper: dict) -> str:
 
 def _generate_html_paper(paper: dict, printable_content: str) -> str:
     """Generate HTML format for the paper"""
+    cfg = paper.get("configuration") or {}
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg)
+        except Exception:
+            cfg = {}
+    institution = cfg.get("institution_name", "")
+    teacher_name = cfg.get("teacher_name") or (cfg.get("teacher_profile") or {}).get("teacher_name", "")
+    course = cfg.get("course_name", "")
+    duration = cfg.get("duration", "")
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -1042,8 +1165,12 @@ def _generate_html_paper(paper: dict, printable_content: str) -> str:
     </head>
     <body>
         <div class="header">
+            {f'<h2>{institution}</h2>' if institution else ''}
             <h1>{paper['title']}</h1>
+            {f'<p>Teacher: {teacher_name}</p>' if teacher_name else ''}
+            {f'<p>Course: {course}</p>' if course else ''}
             <p>Total Marks: {paper.get('total_marks', 0)}</p>
+            {f'<p>Duration: {duration}</p>' if duration else ''}
             <p>Created: {paper.get('created_at', 'Unknown')}</p>
         </div>
         
@@ -1276,7 +1403,7 @@ async def update_paper_endpoint(
         allowed_direct = {"title", "description", "questions", "answer_key", "total_marks",
                           "difficulty_level", "time_limit", "is_published", "class_id"}
         # Fields that live inside the `configuration` JSONB column
-        meta_fields = {"template", "institution_name", "course_name", "exam_date",
+        meta_fields = {"template", "institution_name", "teacher_name", "course_name", "exam_date",
                        "duration", "instructions", "student_fields"}
 
         update_data: dict = {k: v for k, v in payload.items() if k in allowed_direct}
@@ -1358,6 +1485,7 @@ def _serialize_paper(paper: dict) -> dict:
         "difficulty_level": cfg.get("difficulty_level", "medium"),
         "template": cfg.get("template", "classic"),
         "institution_name": cfg.get("institution_name"),
+        "teacher_name": cfg.get("teacher_name") or (cfg.get("teacher_profile") or {}).get("teacher_name"),
         "course_name": cfg.get("course_name"),
         "exam_date": cfg.get("exam_date"),
         "duration": cfg.get("duration"),
@@ -1366,6 +1494,31 @@ def _serialize_paper(paper: dict) -> dict:
         "teacher_id": str(paper["owner_id"]) if paper.get("owner_id") else None,
         "created_at": str(paper["created_at"]),
     }
+
+
+def _normalize_paper_row(paper: dict) -> dict:
+    """Normalize a paper row by parsing JSON fields for internal use."""
+    def _parse_json(val, default):
+        if isinstance(val, str):
+            try:
+                return json.loads(val)
+            except Exception:
+                return default
+        return val if val is not None else default
+
+    normalized = dict(paper)
+    normalized["configuration"] = _parse_json(paper.get("configuration"), {})
+    normalized["questions"] = _parse_json(paper.get("questions"), [])
+    normalized["answer_key"] = _parse_json(paper.get("answer_key"), {})
+
+    if not isinstance(normalized["configuration"], dict):
+        normalized["configuration"] = {}
+    if not isinstance(normalized["questions"], list):
+        normalized["questions"] = []
+    if not isinstance(normalized["answer_key"], dict):
+        normalized["answer_key"] = {}
+
+    return normalized
 
 
 def _build_paper_pdf(

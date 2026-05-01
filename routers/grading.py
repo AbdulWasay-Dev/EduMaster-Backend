@@ -2,7 +2,7 @@
 Answer Sheet Grading API endpoints
 """
 import logging
-from typing import Optional, List
+from typing import Optional, List, Any
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 
@@ -26,7 +26,7 @@ class AnswerSheetGradingRequest(BaseModel):
 class MultipleAnswerSheetGradingRequest(BaseModel):
     """Multiple answer sheet grading request model"""
     paper_id: str
-    student_id: str
+    student_id: Optional[str] = None
     answer_sheet_images: List[str]  # List of base64 encoded images
     grading_mode: str = "auto"  # auto, semi_auto, manual
     strictness: str = "medium"  # lenient, medium, strict
@@ -38,13 +38,21 @@ class GradingResponse(BaseModel):
     id: str = ""  # alias for submission_id
     paper_id: str = ""
     student_id: Optional[str] = None
+    student_name: str = ""
     total_score: float = 0.0
     max_score: float = 0.0
+    score: float = 0.0
+    total_marks: float = 0.0
     grade_percentage: float = 0.0
     grade: str = ""
     status: str = "graded"
     feedback: str = ""
+    ai_feedback: str = ""
     question_scores: list = []
+    question_details: list = []
+    grading_details: list = []
+    ocr_confidence: float = 0.0
+    submitted_at: Optional[str] = None
     graded_at: Optional[str] = None
     created_at: Optional[str] = None
 
@@ -71,7 +79,7 @@ async def upload_and_grade_answer_sheet(
         # Verify teacher has access to the paper
         db = await get_database()
         papers = await db.get_papers(current_teacher["id"])
-        paper_ids = [p["id"] for p in papers]
+        paper_ids = [str(p["id"]) for p in papers]
         
         if request.paper_id not in paper_ids:
             raise HTTPException(
@@ -79,13 +87,14 @@ async def upload_and_grade_answer_sheet(
                 detail="Access denied to this paper"
             )
         
-        # Verify student exists and belongs to teacher's class
-        student = await db.get_student(request.student_id)
-        if not student:
-            raise HTTPException(
-                status_code=404,
-                detail="Student not found"
-            )
+        # Verify student exists and belongs to teacher's class (optional)
+        if request.student_id:
+            student = await db.get_student(request.student_id)
+            if not student:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Student not found"
+                )
         
         # Process and grade the answer sheet
         grading_service = get_answer_sheet_grading_service()
@@ -104,17 +113,23 @@ async def upload_and_grade_answer_sheet(
             )
         
         return GradingResponse(
-            submission_id=result["submission_id"],
-            id=result["submission_id"],
+            submission_id=str(result["submission_id"]),
+            id=str(result["submission_id"]),
             paper_id=request.paper_id,
             student_id=request.student_id,
             total_score=result["total_score"],
             max_score=result.get("max_score", result.get("total_marks", 0)),
+            score=result.get("score", result["total_score"]),
+            total_marks=result.get("total_marks", result.get("max_score", 0)),
             grade_percentage=result["grade_percentage"],
             grade=result.get("grade", ""),
             status="graded",
             feedback=result["feedback"],
+            ai_feedback=result.get("ai_feedback", result["feedback"]),
             question_scores=result.get("question_scores", []),
+            question_details=result.get("question_details", result.get("question_scores", [])),
+            grading_details=result.get("grading_details", result.get("question_scores", [])),
+            ocr_confidence=result.get("ocr_confidence", 0),
             graded_at=result.get("graded_at"),
             created_at=result.get("created_at"),
         )
@@ -143,7 +158,7 @@ async def upload_and_grade_multiple_answer_sheets(
         # Verify teacher has access to the paper
         db = await get_database()
         papers = await db.get_papers(current_teacher["id"])
-        paper_ids = [p["id"] for p in papers]
+        paper_ids = [str(p["id"]) for p in papers]
         
         if request.paper_id not in paper_ids:
             raise HTTPException(
@@ -151,13 +166,14 @@ async def upload_and_grade_multiple_answer_sheets(
                 detail="Access denied to this paper"
             )
         
-        # Verify student exists and belongs to teacher's class
-        student = await db.get_student(request.student_id)
-        if not student:
-            raise HTTPException(
-                status_code=404,
-                detail="Student not found"
-            )
+        # Verify student exists and belongs to teacher's class (optional)
+        if request.student_id:
+            student = await db.get_student(request.student_id)
+            if not student:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Student not found"
+                )
         
         # Process and grade the answer sheets
         grading_service = get_answer_sheet_grading_service()
@@ -176,17 +192,23 @@ async def upload_and_grade_multiple_answer_sheets(
             )
         
         return GradingResponse(
-            submission_id=result["submission_id"],
-            id=result["submission_id"],
+            submission_id=str(result["submission_id"]),
+            id=str(result["submission_id"]),
             paper_id=request.paper_id,
             student_id=request.student_id,
             total_score=result["total_score"],
             max_score=result.get("max_score", result.get("total_marks", 0)),
+            score=result.get("score", result["total_score"]),
+            total_marks=result.get("total_marks", result.get("max_score", 0)),
             grade_percentage=result["grade_percentage"],
             grade=result.get("grade", ""),
             status="graded",
             feedback=result["feedback"],
+            ai_feedback=result.get("ai_feedback", result["feedback"]),
             question_scores=result.get("question_scores", []),
+            question_details=result.get("question_details", result.get("question_scores", [])),
+            grading_details=result.get("grading_details", result.get("question_scores", [])),
+            ocr_confidence=result.get("ocr_confidence", 0),
             graded_at=result.get("graded_at"),
             created_at=result.get("created_at"),
         )
@@ -258,7 +280,7 @@ async def upload_multiple_answer_sheet_files(
         # Verify teacher has access to the paper
         db = await get_database()
         papers = await db.get_papers(current_teacher["id"])
-        paper_ids = [p["id"] for p in papers]
+        paper_ids = [str(p["id"]) for p in papers]
         
         if paper_id not in paper_ids:
             raise HTTPException(
@@ -301,8 +323,16 @@ async def upload_multiple_answer_sheet_files(
         return {
             "submission_id": result["submission_id"],
             "total_score": result["total_score"],
+            "score": result.get("score", result["total_score"]),
+            "max_score": result.get("max_score", result.get("total_marks", 0)),
+            "total_marks": result.get("total_marks", result.get("max_score", 0)),
             "grade_percentage": result["grade_percentage"],
+            "grade": result.get("grade", ""),
             "feedback": result["feedback"],
+            "ai_feedback": result.get("ai_feedback", result["feedback"]),
+            "question_scores": result.get("question_scores", []),
+            "question_details": result.get("question_details", result.get("question_scores", [])),
+            "grading_details": result.get("grading_details", result.get("question_scores", [])),
             "confidence_score": result.get("confidence_score", 0.75),
             "images_processed": result.get("images_processed", len(files)),
             "ocr_confidence": result.get("ocr_confidence", 0.75)
@@ -331,7 +361,7 @@ async def get_class_grading_results(
         
         # Verify teacher has access to the class
         classes = await db.get_classes(current_teacher["id"])
-        class_ids = [c["id"] for c in classes]
+        class_ids = [str(c["id"]) for c in classes]
         
         if class_id not in class_ids:
             raise HTTPException(
@@ -345,8 +375,8 @@ async def get_class_grading_results(
         # Get all submissions for these papers
         all_submissions = []
         for paper in papers:
-            submissions = await db.get_submissions(paper["id"])
-            all_submissions.extend(submissions)
+            submissions = await db.get_submissions(str(paper["id"]))
+            all_submissions.extend(_serialize_submission(submission, paper) for submission in submissions)
         
         return {
             "class_id": class_id,
@@ -384,19 +414,14 @@ async def get_grading_result(
             )
         
         # Verify teacher has access to this submission
-        paper = await db.get_paper(submission["paper_id"])
-        if not paper or paper["owner_id"] != current_teacher["id"]:
+        paper = await db.get_paper(str(submission["paper_id"]))
+        if not paper or str(paper["owner_id"]) != str(current_teacher["id"]):
             raise HTTPException(
                 status_code=403,
                 detail="Access denied to this submission"
             )
         
-        return GradingResponse(
-            submission_id=submission["id"],
-            total_score=submission["total_score"],
-            grade_percentage=submission["grade_percentage"],
-            feedback=submission["feedback"],
-        )
+        return GradingResponse(**_serialize_submission(submission, paper))
         
     except HTTPException:
         raise
@@ -478,8 +503,8 @@ async def delete_submission(
             raise HTTPException(status_code=404, detail="Submission not found")
 
         # Verify ownership via paper
-        paper = await db.get_paper(submission.get("paper_id"))
-        if not paper or paper.get("owner_id") != current_teacher["id"]:
+        paper = await db.get_paper(str(submission.get("paper_id")))
+        if not paper or str(paper.get("owner_id")) != str(current_teacher["id"]):
             raise HTTPException(status_code=403, detail="Access denied to this submission")
 
         # Delete using service-role client
@@ -511,9 +536,9 @@ async def get_class_paper_results(
         paper = await db.get_paper(paper_id)
         if not paper:
             raise HTTPException(status_code=404, detail="Paper not found")
-        if paper.get("owner_id") != current_teacher["id"]:
+        if str(paper.get("owner_id")) != str(current_teacher["id"]):
             raise HTTPException(status_code=403, detail="Access denied to this paper")
-        if paper.get("class_id") and paper.get("class_id") != class_id:
+        if paper.get("class_id") and str(paper.get("class_id")) != str(class_id):
             raise HTTPException(status_code=403, detail="Paper does not belong to this class")
 
         # Fetch submissions for the paper
@@ -525,7 +550,7 @@ async def get_class_paper_results(
         for sub in submissions:
             sid = sub.get("student_id")
             if sid and sid not in seen_students:
-                student = await db.get_student(sid)
+                student = await db.get_student(str(sid))
                 seen_students[sid] = {
                     "student_name": (student or {}).get("student_name") or (student or {}).get("name") or "",
                     "roll_number": (student or {}).get("roll_number") or (student or {}).get("roll_no") or (student or {}).get("roll")
@@ -535,14 +560,18 @@ async def get_class_paper_results(
         for sub in submissions:
             sid = sub.get("student_id")
             info = seen_students.get(sid, {"student_name": "", "roll_number": None})
+            serialized = _serialize_submission(sub, paper)
             results.append({
                 "submission_id": sub.get("id"),
                 "student_id": sid,
                 "student_name": info["student_name"],
                 "roll_number": info["roll_number"],
-                "total_score": sub.get("total_score", 0),
-                "grade_percentage": sub.get("grade_percentage", 0),
-                "feedback": sub.get("feedback", ""),
+                "total_score": serialized.get("total_score", 0),
+                "score": serialized.get("score", 0),
+                "max_score": serialized.get("max_score", 0),
+                "total_marks": serialized.get("total_marks", 0),
+                "grade_percentage": serialized.get("grade_percentage", 0),
+                "feedback": serialized.get("feedback", ""),
                 "created_at": sub.get("created_at")
             })
 
@@ -585,10 +614,10 @@ async def list_submissions(
             if paper_id and str(paper["id"]) != paper_id:
                 continue
             subs = await db.get_submissions(str(paper["id"]))
-            all_submissions.extend(subs)
+            all_submissions.extend(_serialize_submission(s, paper) for s in subs)
 
         return {
-            "submissions": [_serialize_submission(s) for s in all_submissions],
+            "submissions": all_submissions,
             "total": len(all_submissions),
         }
     except Exception as e:
@@ -611,7 +640,7 @@ async def get_submission(
         paper = await db.get_paper(str(submission["paper_id"]))
         if not paper or str(paper["owner_id"]) != str(current_teacher["id"]):
             raise HTTPException(status_code=403, detail="Access denied to this submission")
-        return _serialize_submission(submission)
+        return _serialize_submission(submission, paper)
     except HTTPException:
         raise
     except Exception as e:
@@ -641,29 +670,52 @@ async def override_submission_score(
         if not paper or str(paper["owner_id"]) != str(current_teacher["id"]):
             raise HTTPException(status_code=403, detail="Access denied")
 
-        # Update grading_details in the submission_data JSON blob if present
-        import json as _json
-        raw = submission.get("submission_data")
-        if isinstance(raw, str):
-            sub_data = _json.loads(raw)
-        else:
-            sub_data = raw or {}
+        # Update grading details in the submission_data JSON blob if present.
+        sub_data = _parse_jsonish(submission.get("submission_data"), {})
+        if not isinstance(sub_data, dict):
+            sub_data = {}
 
-        details = sub_data.get("question_details", [])
+        details = sub_data.get("question_details") or sub_data.get("grading_details") or []
+        if not isinstance(details, list):
+            details = []
         for item in details:
             if str(item.get("question_id", "")) == payload.question_id:
                 item["scored_marks"] = payload.score
+                item["marks_awarded"] = payload.score
+                item["score"] = payload.score
                 if payload.note:
                     item["override_note"] = payload.note
+                    item["ai_comment"] = payload.note
+                    item["ai_feedback"] = payload.note
                 break
 
+        total_score = sum(
+            _to_float(_first_present(item.get("marks_awarded"), item.get("scored_marks"), item.get("score")), 0.0) or 0.0
+            for item in details
+            if isinstance(item, dict)
+        )
+        max_score = _to_float(_first_present(
+            sub_data.get("max_score"),
+            sub_data.get("total_marks"),
+            paper.get("total_marks"),
+        ), 0.0) or 0.0
+        grade_percentage = (total_score / max_score) * 100 if max_score > 0 else 0.0
+        sub_data["question_details"] = details
+        sub_data["grading_details"] = details
+        sub_data["score"] = total_score
+        sub_data["total_score"] = total_score
+        sub_data["grade_percentage"] = round(grade_percentage, 2)
+        sub_data["grade"] = _grade_label(grade_percentage)
+
         updated = await db.update_submission(submission_id, {
-            "submission_data": _json.dumps(sub_data)
+            "submission_data": sub_data,
+            "total_score": total_score,
+            "grade_percentage": grade_percentage,
         })
         if not updated:
             raise HTTPException(status_code=500, detail="Failed to update submission")
 
-        return _serialize_submission(updated)
+        return _serialize_submission(updated, paper)
     except HTTPException:
         raise
     except Exception as e:
@@ -671,19 +723,119 @@ async def override_submission_score(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-def _serialize_submission(s: dict) -> dict:
-    """Serialize a submission DB row to a JSON-safe dict"""
+def _serialize_submission(s: dict, paper: Optional[dict] = None) -> dict:
+    """Serialize a submission DB row to the frontend-compatible grading shape."""
+    sub_data = _parse_jsonish(s.get("submission_data"), {})
+    if not isinstance(sub_data, dict):
+        sub_data = {}
+
+    question_details = (
+        sub_data.get("question_details")
+        or sub_data.get("grading_details")
+        or sub_data.get("question_scores")
+        or []
+    )
+    if not isinstance(question_details, list):
+        question_details = []
+
+    total_score = _to_float(_first_present(
+        s.get("total_score"),
+        sub_data.get("total_score"),
+        sub_data.get("score"),
+    ), 0.0)
+
+    max_score = _to_float(_first_present(
+        s.get("max_score"),
+        s.get("max_marks"),
+        sub_data.get("max_score"),
+        sub_data.get("total_marks"),
+        paper.get("total_marks") if paper else None,
+    ), 0.0)
+
+    grade_percentage = _to_float(_first_present(
+        s.get("grade_percentage"),
+        sub_data.get("grade_percentage"),
+    ), None)
+    if grade_percentage is None:
+        grade_percentage = (total_score / max_score) * 100 if max_score > 0 else 0.0
+
+    raw_status = _first_present(s.get("grading_status"), s.get("status"), sub_data.get("status"), "graded")
+    status = "graded" if str(raw_status).lower() in {"completed", "complete", "done"} else str(raw_status)
+
+    feedback = str(_first_present(s.get("feedback"), sub_data.get("feedback"), sub_data.get("ai_feedback"), ""))
+    submission_id = str(s.get("id", ""))
+    submitted_at = _first_present(s.get("submitted_at"), s.get("created_at"), "")
+    graded_at = _first_present(s.get("graded_at"), s.get("updated_at"), s.get("created_at"), "")
+
     return {
-        "id": str(s.get("id", "")),
+        "id": submission_id,
+        "submission_id": submission_id,
         "paper_id": str(s.get("paper_id", "")),
+        "paper_title": (paper or {}).get("title", ""),
         "student_id": str(s.get("student_id", "")) if s.get("student_id") else None,
-        "total_score": s.get("total_score", 0),
-        "max_score": s.get("max_score") or s.get("max_marks") or 0,
-        "grade_percentage": s.get("grade_percentage", 0),
-        "grading_mode": s.get("grading_mode", "auto"),
-        "status": s.get("grading_status") or s.get("status") or "graded",
-        "feedback": s.get("feedback", ""),
-        "submitted_at": str(s.get("created_at", "")),
-        "graded_at": str(s.get("updated_at", "")) if s.get("updated_at") else None,
+        "student_name": s.get("student_name", ""),
+        "class_id": str(s.get("class_id", "")) if s.get("class_id") else None,
+        "total_score": total_score,
+        "max_score": max_score,
+        "score": total_score,
+        "total_marks": max_score,
+        "grade_percentage": round(grade_percentage, 2),
+        "grade": sub_data.get("grade") or _grade_label(grade_percentage),
+        "grading_mode": sub_data.get("grading_mode") or s.get("grading_mode") or "auto",
+        "status": status,
+        "feedback": feedback,
+        "ai_feedback": feedback,
+        "question_scores": question_details,
+        "question_details": question_details,
+        "grading_details": question_details,
+        "ocr_confidence": _to_float(_first_present(s.get("ocr_confidence"), sub_data.get("ocr_confidence")), 0.0),
+        "submitted_at": str(submitted_at),
+        "graded_at": str(graded_at),
+        "created_at": str(s.get("created_at", "")),
     }
+
+
+def _parse_jsonish(value: Any, fallback: Any) -> Any:
+    if value is None:
+        return fallback
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            import json as _json
+            return _json.loads(value)
+        except Exception:
+            return fallback
+    return fallback
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _to_float(value: Any, fallback: Optional[float] = 0.0) -> Optional[float]:
+    if value is None or value == "":
+        return fallback
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _grade_label(percentage: float) -> str:
+    pct = _to_float(percentage, 0.0) or 0.0
+    if pct >= 90:
+        return "A+"
+    if pct >= 80:
+        return "A"
+    if pct >= 70:
+        return "B"
+    if pct >= 60:
+        return "C"
+    if pct >= 50:
+        return "D"
+    return "F"
 

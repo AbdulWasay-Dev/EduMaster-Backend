@@ -4,7 +4,7 @@ Configuration settings for EduMaster Backend
 import os
 from typing import Optional
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, field_validator
 
 
 class Settings(BaseSettings):
@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     
     # API Configuration
     api_v1_prefix: str = "/api/v1"
+    port: int = Field(default=8010, env="PORT")
     cors_origins: list[str] = Field(
         default=["*"],  # Allow all origins in development
         env="CORS_ORIGINS"
@@ -87,6 +88,18 @@ class Settings(BaseSettings):
     # Monitoring
     sentry_dsn: Optional[str] = Field(default=None, env="SENTRY_DSN")
     enable_metrics: bool = Field(default=True, env="ENABLE_METRICS")
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def parse_debug_flag(cls, value):
+        """Accept common environment labels accidentally supplied as DEBUG."""
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"release", "prod", "production", "false", "0", "no", "off"}:
+                return False
+            if normalized in {"debug", "dev", "development", "true", "1", "yes", "on"}:
+                return True
+        return value
     
     class Config:
         env_file = ".env"

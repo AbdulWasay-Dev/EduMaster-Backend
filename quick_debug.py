@@ -7,7 +7,7 @@ import json
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-BASE_URL = "http://localhost:8000/api/v1"
+BASE_URL = "http://localhost:8010/api/v1"
 
 def test_with_timeout():
     """Test with timeout to avoid hanging"""

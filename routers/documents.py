@@ -374,8 +374,9 @@ async def process_document_async(document_id: str):
             await db.update_document_status(document_id, "failed")
             return
         
-        # Extract text for pdf only (skip OCR per request)
-        text = await text_extractor.extract_text(file_bytes, document["file_type"]) if document["file_type"] in ["pdf", "pptx"] else None
+        # Extract text for supported types (skip OCR per request)
+        supported_text_types = {"pdf", "pptx", "docx"}
+        text = await text_extractor.extract_text(file_bytes, document["file_type"]) if document["file_type"] in supported_text_types else None
         if not text:
             await db.update_document_status(document_id, "failed")
             return

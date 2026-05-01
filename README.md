@@ -63,16 +63,16 @@ Required environment variables:
 
 ```bash
 # Development
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+uvicorn main:app --reload --host 0.0.0.0 --port 8010
 
 # Production
-uvicorn main:app --host 0.0.0.0 --port 8000
+uvicorn main:app --host 0.0.0.0 --port 8010
 ```
 
 ### 5. Access the API
 
-- **API Documentation**: http://localhost:8000/docs
-- **Health Check**: http://localhost:8000/health
+- **API Documentation**: http://localhost:8010/docs
+- **Health Check**: http://localhost:8010/health
 
 ## 📁 Project Structure
 
@@ -164,7 +164,7 @@ backend/
 docker build -t edumaster-backend .
 
 # Run container
-docker run -p 8000:8000 --env-file .env edumaster-backend
+docker run -p 8010:8010 --env-file .env edumaster-backend
 ```
 
 ## 🧪 Testing

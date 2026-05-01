@@ -45,9 +45,40 @@ class DatabaseService:
         profile_image_url TEXT,
         school_name TEXT,
         department TEXT,
+        institution_type TEXT,
+        institution_level TEXT,
+        institution_address TEXT,
+        institution_city TEXT,
+        institution_country TEXT,
+        designation TEXT,
+        qualification TEXT,
+        specialization TEXT,
+        employee_id TEXT,
+        phone TEXT,
+        default_course_name TEXT,
+        default_exam_duration TEXT,
+        default_exam_instructions TEXT,
+        default_student_fields JSONB DEFAULT '["name", "roll_number"]',
+        default_paper_template TEXT DEFAULT 'classic',
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
+
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS institution_type TEXT;
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS institution_level TEXT;
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS institution_address TEXT;
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS institution_city TEXT;
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS institution_country TEXT;
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS designation TEXT;
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS qualification TEXT;
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS specialization TEXT;
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS employee_id TEXT;
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS phone TEXT;
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS default_course_name TEXT;
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS default_exam_duration TEXT;
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS default_exam_instructions TEXT;
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS default_student_fields JSONB DEFAULT '["name", "roll_number"]';
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS default_paper_template TEXT DEFAULT 'classic';
 
     CREATE TABLE IF NOT EXISTS classes (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -529,8 +560,18 @@ class DatabaseService:
             async with self.connection() as conn:
                 row = await conn.fetchrow(
                     """
-                    INSERT INTO teachers (id, email, name, role, password_hash, profile_image_url, school_name, department)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    INSERT INTO teachers (
+                        id, email, name, role, password_hash, profile_image_url,
+                        school_name, department, institution_type, institution_level,
+                        institution_address, institution_city, institution_country,
+                        designation, qualification, specialization, employee_id, phone,
+                        default_course_name, default_exam_duration, default_exam_instructions,
+                        default_student_fields, default_paper_template
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
+                    )
                     RETURNING *
                     """,
                     uuid.UUID(teacher_id),
@@ -540,7 +581,22 @@ class DatabaseService:
                     teacher_data.get("password_hash"),
                     teacher_data.get("profile_image_url"),
                     teacher_data.get("school_name"),
-                    teacher_data.get("department")
+                    teacher_data.get("department"),
+                    teacher_data.get("institution_type"),
+                    teacher_data.get("institution_level"),
+                    teacher_data.get("institution_address"),
+                    teacher_data.get("institution_city"),
+                    teacher_data.get("institution_country"),
+                    teacher_data.get("designation"),
+                    teacher_data.get("qualification"),
+                    teacher_data.get("specialization"),
+                    teacher_data.get("employee_id"),
+                    teacher_data.get("phone"),
+                    teacher_data.get("default_course_name"),
+                    teacher_data.get("default_exam_duration"),
+                    teacher_data.get("default_exam_instructions"),
+                    json.dumps(teacher_data.get("default_student_fields", ["name", "roll_number"])),
+                    teacher_data.get("default_paper_template", "classic")
                 )
                 return dict(row) if row else None
         except Exception as e:
@@ -555,6 +611,8 @@ class DatabaseService:
             idx = 1
             for key, value in teacher_data.items():
                 if key != "id":
+                    if key == "default_student_fields" and isinstance(value, list):
+                        value = json.dumps(value)
                     set_clauses.append(f"{key} = ${idx}")
                     values.append(value)
                     idx += 1

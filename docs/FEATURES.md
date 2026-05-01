@@ -111,7 +111,7 @@ API v1 prefix: `settings.api_v1_prefix` (default `/api/v1`)
 - CORS configurable via `CORS_ORIGINS` env (allow `[*]` for dev; restrict in production)
 
 ### 6) Operations and Deployment
-- Run locally: `uvicorn main:app --reload --host 0.0.0.0 --port 8000`
+- Run locally: `uvicorn main:app --reload --host 0.0.0.0 --port 8010`
 - Production (example): systemd service executing uvicorn, and Nginx reverse proxy on port 80
 - Auto-deploy: webhook triggers `deploy.sh` (pull latest, install, restart service)
 - Health checks:

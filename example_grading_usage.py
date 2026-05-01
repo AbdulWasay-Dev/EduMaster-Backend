@@ -141,7 +141,7 @@ async def example_api_usage():
     import json
     
     # Example API call for single image grading
-    api_url = "http://localhost:8000/api/v1/grading/upload-answer-sheet"
+    api_url = "http://localhost:8010/api/v1/grading/upload-answer-sheet"
     
     headers = {
         "Authorization": "Bearer your-jwt-token",
@@ -176,7 +176,7 @@ async def example_api_usage():
         print(f"Error: {response.text}")
     
     # Example API call for multiple images
-    api_url_multiple = "http://localhost:8000/api/v1/grading/upload-multiple-answer-sheets"
+    api_url_multiple = "http://localhost:8010/api/v1/grading/upload-multiple-answer-sheets"
     
     # Prepare multiple images
     image_paths = ["page1.jpg", "page2.jpg", "page3.jpg"]
