@@ -21,8 +21,12 @@ class LLMService:
         """Initialize Groq async client"""
         try:
             self.model_name = settings.groq_llm_model
-            self.client = AsyncGroq(api_key=settings.groq_api_key)
-            logger.info(f"✅ Groq LLM service initialized — model: {self.model_name}")
+            self.api_keys = settings.all_groq_keys
+            if not self.api_keys:
+                self.api_keys = [settings.groq_api_key]
+            self.current_key_idx = 0
+            self.client = AsyncGroq(api_key=self.api_keys[self.current_key_idx])
+            logger.info(f"✅ Groq LLM service initialized — model: {self.model_name}, loaded {len(self.api_keys)} keys")
         except Exception as e:
             logger.error(f"❌ Failed to initialize Groq LLM service: {e}")
             raise
@@ -33,17 +37,32 @@ class LLMService:
 
     async def _chat(self, prompt: str, max_tokens: int = 2048) -> Optional[str]:
         """Send a prompt to Groq and return the text response."""
-        try:
-            resp = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                temperature=0.3,
-            )
-            return resp.choices[0].message.content
-        except Exception as e:
-            logger.error(f"Groq API error: {e}")
-            return None
+        attempts = 0
+        max_attempts = len(self.api_keys)
+        
+        while attempts < max_attempts:
+            try:
+                resp = await self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                    temperature=0.3,
+                )
+                return resp.choices[0].message.content
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Groq API error on key index {self.current_key_idx}: {error_msg}")
+                # Check for rate limit error (429)
+                if "429" in error_msg or "rate_limit_exceeded" in error_msg.lower():
+                    attempts += 1
+                    if attempts < max_attempts:
+                        self.current_key_idx = (self.current_key_idx + 1) % len(self.api_keys)
+                        logger.warning(f"Rate limit hit. Switching to Groq API key index {self.current_key_idx}")
+                        self.client = AsyncGroq(api_key=self.api_keys[self.current_key_idx])
+                        continue
+                return None
+        logger.error("All Groq API keys exhausted or failed.")
+        return None
     
     async def generate_answer(
         self,
@@ -330,51 +349,60 @@ OUTPUT STRICT JSON ONLY:
 
             for head, tail in [(7000, 3000), (4500, 1500), (3000, 800)]:
                 ocr_sliced = slice_ocr(ocr_text_combined, head, tail)
-                prompt = f"""You are an experienced examiner grading a student's scanned answer sheet.
+                prompt = f"""You are an experienced, fair examiner grading a student's scanned answer sheet.
 
-The student's answers were extracted by OCR and may contain handwriting/OCR mistakes.
-Only grade what the student actually wrote in the OCR text. The answer key is for comparison only.
+The student wrote answers BY HAND and the text below was extracted via OCR.
+OCR is inherently noisy: expect misspellings, missing spaces, merged lines,
+number–letter confusion (0/O, 1/l/I, 5/S), and formatting artifacts.
+Do your best to understand what the student actually wrote.
 
-STUDENT_ANSWERS_TEXT:
+STUDENT_ANSWERS_TEXT (raw OCR — may be noisy):
 {ocr_sliced}
 
 QUESTIONS_AND_ANSWER_KEY_JSON:
 {q_json}
 
-GRADING_RULES:
-- Grade every question independently.
-- Find each student's answer in STUDENT_ANSWERS_TEXT using question numbers, wording, and nearby context.
-- Do not copy, paraphrase, or infer a student answer from the answer key.
-- Do not assume the student attempted a question just because it exists in QUESTIONS_AND_ANSWER_KEY_JSON.
-- Award marks between 0 and each question's max_marks.
-- Use partial credit for short answers, long answers, essays, and fill-in-the-blank responses.
-- For MCQ and true/false, accept clear equivalent answers even if OCR is noisy.
-- If a question is not answered or cannot be found in STUDENT_ANSWERS_TEXT, set student_answer to "", evidence_quote to "", and award 0.
-- For every non-zero score, evidence_quote must be a direct short quote copied from STUDENT_ANSWERS_TEXT that proves the student's answer exists.
-- evidence_quote must include the actual answer words/options the student wrote.
-- evidence_quote must come from the student's written response, not from printed question text, headers, instructions, or repeated answer-key text.
-- If only the printed question appears and no student response follows it, award 0.
-- If there is no direct OCR evidence for an answer, the score must be 0 even if the answer key is obvious.
-- Strictness: {strictness}.
-- Recompute the total from the per-question marks. The paper is out of {resolved_total} marks.
-- Keep comments short and specific.
+GRADING_RULES — follow these EXACTLY:
+1. Grade EVERY question listed in QUESTIONS_AND_ANSWER_KEY_JSON independently.
+2. For each question, search the STUDENT_ANSWERS_TEXT for the student's
+   response by looking for question numbers ("1.", "Q1", "1)", etc.),
+   keywords from the question, and nearby handwritten content.
+3. OCR may merge questions or split them across lines. Use context and
+   surrounding text to determine where one answer ends and the next begins.
+4. Do NOT copy, paraphrase, or infer a student answer from the answer key.
+5. If the student genuinely attempted a question, set "attempted": true
+   even if their answer is wrong.
+6. If a question has NO student response anywhere in the OCR text,
+   set student_answer to "", evidence_quote to "", attempted to false,
+   and award 0 marks.
+7. For MCQ / true-false: accept clear equivalent answers ("A", "a",
+   option text, or similar) even through OCR noise.
+8. For short-answer / essay / fill-blank: award partial credit based on
+   how close the student's response is to the correct answer.
+9. For every non-zero score, provide a short evidence_quote — a snippet
+   from STUDENT_ANSWERS_TEXT showing what the student wrote.
+10. Strictness level: {strictness}.
+11. Compute the total from summing per-question marks_awarded.
+    The paper is out of {resolved_total} marks.
+12. Keep ai_comment short (one sentence).
 
-OUTPUT STRICT JSON ONLY:
+OUTPUT STRICT JSON ONLY (no markdown, no explanation outside JSON):
 {{
   "question_details": [
     {{
       "question_id": "<same id from input>",
-      "student_answer": "<answer copied/extracted from OCR, or empty string>",
-      "evidence_quote": "<exact short quote from STUDENT_ANSWERS_TEXT proving this answer exists, or empty string>",
-      "marks_awarded": <number>,
+      "student_answer": "<what the student wrote, extracted from OCR, or empty>",
+      "evidence_quote": "<short snippet from STUDENT_ANSWERS_TEXT, or empty>",
+      "marks_awarded": <number between 0 and max_marks>,
       "max_marks": <number>,
       "is_correct": <true|false>,
-      "ai_comment": "<short reason for the awarded marks>",
-      "confidence": <0.0-1.0 number>
+      "attempted": <true|false>,
+      "ai_comment": "<one-sentence reason>",
+      "confidence": <0.0-1.0>
     }}
   ],
-  "overall_feedback": "<2-4 lines of feedback>",
-  "confidence": <0.0-1.0 number>
+  "overall_feedback": "<2-4 sentence summary>",
+  "confidence": <0.0-1.0>
 }}"""
 
                 resp_text = await self._chat(prompt, max_tokens=4096)
@@ -461,7 +489,14 @@ OUTPUT STRICT JSON ONLY:
         total_marks: float,
         ocr_text: str = "",
     ) -> Optional[Dict[str, Any]]:
-        """Parse and normalize per-question grading JSON from the LLM."""
+        """Parse and normalize per-question grading JSON from the LLM.
+
+        Important: We trust the LLM's grading judgment more than rigid
+        string-matching evidence validation.  OCR text is inherently noisy
+        and fuzzy matching frequently produces false negatives, causing
+        legitimate marks to be zeroed out.  Instead we only zero a score
+        when the LLM itself returned no student_answer AND no evidence.
+        """
         try:
             start_idx = resp_text.find('{')
             end_idx = resp_text.rfind('}') + 1
@@ -501,16 +536,23 @@ OUTPUT STRICT JSON ONLY:
                 evidence_quote = str(raw.get("evidence_quote") or raw.get("ocr_evidence") or "") if isinstance(raw, dict) else ""
                 ai_comment = str(raw.get("ai_comment") or raw.get("ai_feedback") or raw.get("feedback") or "") if isinstance(raw, dict) else ""
 
-                has_answer_evidence = self._has_student_answer_evidence(
-                    ocr_text=ocr_text,
-                    evidence_quote=evidence_quote,
-                    student_answer=student_answer,
-                    question_text=str(question.get("question_text", "")),
-                )
-                if marks_awarded > 0 and (not student_answer.strip() or not has_answer_evidence):
+                # Determine whether the student attempted this question.
+                # We trust the LLM: if it returned a non-empty student_answer
+                # or a non-empty evidence_quote, the student attempted it.
+                attempted_raw = raw.get("attempted") if isinstance(raw, dict) else None
+                attempted = bool(student_answer.strip()) or bool(evidence_quote.strip())
+                if attempted_raw is not None:
+                    attempted = bool(attempted_raw)
+
+                # Soft evidence check: only zero out when the LLM itself
+                # says the student didn't answer (empty student_answer AND
+                # empty evidence_quote).  This avoids false negatives from
+                # fuzzy string matching against noisy OCR.
+                if marks_awarded > 0 and not student_answer.strip() and not evidence_quote.strip():
                     marks_awarded = 0.0
-                    is_missing_reason = "No matching student-answer evidence was found in the OCR text."
-                    ai_comment = f"{ai_comment} {is_missing_reason}".strip() if ai_comment else is_missing_reason
+                    attempted = False
+                    ai_comment = (ai_comment + " No student answer found in OCR text.").strip()
+
                 marks_awarded = max(0.0, min(marks_awarded, max_marks))
                 total_score += marks_awarded
 
@@ -532,7 +574,7 @@ OUTPUT STRICT JSON ONLY:
                     "question_type": question.get("question_type", "short_answer"),
                     "student_answer": student_answer,
                     "student_answer_text": student_answer,
-                    "evidence_quote": evidence_quote if has_answer_evidence else "",
+                    "evidence_quote": evidence_quote,
                     "correct_answer": question.get("correct_answer", ""),
                     "marks_awarded": marks_awarded,
                     "scored_marks": marks_awarded,
@@ -540,11 +582,12 @@ OUTPUT STRICT JSON ONLY:
                     "score": marks_awarded,
                     "max_score": max_marks,
                     "is_correct": bool(is_correct),
+                    "attempted": attempted,
                     "ai_comment": ai_comment,
                     "ai_feedback": ai_comment,
                     "confidence": confidence,
                     "ai_confidence": confidence,
-                    "evidence_found": has_answer_evidence,
+                    "evidence_found": bool(evidence_quote.strip()),
                 })
 
             grade_percentage = (total_score / total_marks) * 100 if total_marks > 0 else 0.0

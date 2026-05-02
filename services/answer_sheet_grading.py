@@ -59,6 +59,8 @@ class AnswerSheetGradingService:
             
             combined_result = ocr_results[0]  # combined OCR across pages
             combined_text = combined_result.get("combined_text", "")
+
+            logger.info(f"OCR extracted {len(combined_text)} characters from {len(answer_sheet_images)} images")
             
             # Get paper details and answer key
             paper = await self._get_paper_details(paper_id)
@@ -160,6 +162,8 @@ class AnswerSheetGradingService:
             
             ocr_text = ocr_result["text"]
             ocr_confidence = ocr_result["confidence"]
+
+            logger.info(f"OCR extracted {len(ocr_text)} characters with confidence {ocr_confidence:.2f}")
             
             # Get paper details and answer key
             paper = await self._get_paper_details(paper_id)
@@ -253,47 +257,52 @@ class AnswerSheetGradingService:
             return None
     
     def _preprocess_image(self, image_data: bytes) -> np.ndarray:
-        """Preprocess image for better OCR results"""
+        """Preprocess image for better OCR results.
+
+        Uses CLAHE contrast enhancement which preserves handwriting detail
+        better than aggressive binarization.
+        """
         try:
-            # Convert bytes to PIL Image
-            pil_image = Image.open(io.BytesIO(image_data))
-            
-            # Convert to OpenCV format
+            pil_image = Image.open(io.BytesIO(image_data)).convert('RGB')
+
+            # Upscale small images for better Tesseract accuracy
+            w, h = pil_image.size
+            if max(w, h) < 1500:
+                scale = 1500 / max(w, h)
+                pil_image = pil_image.resize(
+                    (int(w * scale), int(h * scale)), Image.LANCZOS
+                )
+
             cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-            
-            # Convert to grayscale
             gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-            
-            # Apply Gaussian blur to reduce noise
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            
-            # Apply adaptive thresholding
-            thresh = cv2.adaptiveThreshold(
-                blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-            )
-            
-            # Morphological operations to clean up
-            kernel = np.ones((1, 1), np.uint8)
-            cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-            
-            return cleaned
-            
+
+            # CLAHE contrast enhancement - keeps more detail than thresholding
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+
+            return enhanced
+
         except Exception as e:
             logger.error(f"Error preprocessing image: {e}")
             return np.array(Image.open(io.BytesIO(image_data)))
     
     def _extract_text_from_image(self, image: np.ndarray) -> str:
-        """Extract text from preprocessed image using OCR"""
-        try:
-            # Configure Tesseract for better handwriting recognition
-            custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.,!?()[]{}:;"\' '
-            
-            text = pytesseract.image_to_string(image, config=custom_config)
-            return text.strip()
-            
-        except Exception as e:
-            logger.error(f"Error extracting text from image: {e}")
-            return ""
+        """Extract text from preprocessed image using OCR.
+
+        No character whitelist - we need ALL characters including digits,
+        punctuation, and symbols that appear in handwritten answer sheets.
+        """
+        best_text = ""
+        for psm in [6, 4, 3]:
+            try:
+                config = f"--oem 3 --psm {psm}"
+                text = pytesseract.image_to_string(image, config=config)
+                text = text.strip()
+                if len(text) > len(best_text):
+                    best_text = text
+            except Exception as e:
+                logger.warning(f"Tesseract PSM {psm} failed: {e}")
+        return best_text
     
     async def _get_paper_details(self, paper_id: str) -> Optional[Dict[str, Any]]:
         """Get paper details (questions, answer_key, total_marks) from database"""
