@@ -16,7 +16,7 @@ from config import get_settings, Settings
 from utils.security import setup_security_middleware
 from utils.logging_config import setup_logging
 from services.database import get_database
-from routers import auth, subjects, documents, rag, grading, classes, students, analytics, notifications, papers
+from routers import auth, subjects, documents, rag, grading, classes, students, analytics, notifications, papers, schedule, attendance
 from routers import student_auth, assignments, student_portal
 
 
@@ -200,6 +200,18 @@ app.include_router(
     papers.router,
     prefix=f"{settings.api_v1_prefix}/papers",
     tags=["Papers"]
+)
+
+app.include_router(
+    schedule.router,
+    prefix=f"{settings.api_v1_prefix}/schedule",
+    tags=["Schedule"]
+)
+
+app.include_router(
+    attendance.router,
+    prefix=f"{settings.api_v1_prefix}/attendance",
+    tags=["Attendance"]
 )
 
 app.include_router(

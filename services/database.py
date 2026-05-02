@@ -425,6 +425,50 @@ class DatabaseService:
     DROP TRIGGER IF EXISTS update_assignment_submissions_updated_at ON assignment_submissions;
     CREATE TRIGGER update_assignment_submissions_updated_at BEFORE UPDATE ON assignment_submissions
         FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+    CREATE TABLE IF NOT EXISTS schedule_events (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        teacher_id UUID REFERENCES teachers(id) ON DELETE CASCADE NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        date TEXT NOT NULL,
+        start_time TEXT NOT NULL,
+        end_time TEXT NOT NULL,
+        type TEXT NOT NULL CHECK (type IN ('class', 'quiz', 'assignment', 'paper', 'personal')),
+        class_id UUID REFERENCES classes(id) ON DELETE SET NULL,
+        is_all_day BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_schedule_events_teacher ON schedule_events(teacher_id);
+    CREATE INDEX IF NOT EXISTS idx_schedule_events_date ON schedule_events(date);
+
+    DROP TRIGGER IF EXISTS update_schedule_events_updated_at ON schedule_events;
+    CREATE TRIGGER update_schedule_events_updated_at BEFORE UPDATE ON schedule_events
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+    CREATE TABLE IF NOT EXISTS attendance_records (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        teacher_id UUID REFERENCES teachers(id) ON DELETE CASCADE NOT NULL,
+        class_id UUID REFERENCES classes(id) ON DELETE CASCADE NOT NULL,
+        subject_id UUID REFERENCES subjects(id) ON DELETE CASCADE,
+        student_id UUID REFERENCES students(id) ON DELETE CASCADE NOT NULL,
+        date DATE NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('present', 'absent', 'late', 'excused')),
+        remarks TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        UNIQUE(class_id, subject_id, student_id, date)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_attendance_teacher ON attendance_records(teacher_id);
+    CREATE INDEX IF NOT EXISTS idx_attendance_student ON attendance_records(student_id);
+    CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_records(date);
+
+    DROP TRIGGER IF EXISTS update_attendance_records_updated_at ON attendance_records;
+    CREATE TRIGGER update_attendance_records_updated_at BEFORE UPDATE ON attendance_records
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
     """
 
     async def initialize(self):
@@ -1773,6 +1817,148 @@ class DatabaseService:
             logger.error(f"Error getting subjects for class {class_id}: {e}")
             return []
 
+    # ==================== Schedule Operations ====================
+
+    async def create_schedule_event(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        try:
+            event_id = data.get("id") or str(uuid.uuid4())
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO schedule_events (
+                        id, teacher_id, title, description, date, start_time, end_time, type, class_id, is_all_day
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    RETURNING *
+                    """,
+                    uuid.UUID(event_id),
+                    uuid.UUID(data["teacher_id"]),
+                    data["title"],
+                    data.get("description"),
+                    data["date"],
+                    data["start_time"],
+                    data["end_time"],
+                    data["type"],
+                    uuid.UUID(data["class_id"]) if data.get("class_id") else None,
+                    data.get("is_all_day", False)
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error creating schedule event: {e}")
+            return None
+
+    async def get_schedule_events(self, teacher_id: str, start_date: str = None, end_date: str = None) -> List[Dict[str, Any]]:
+        try:
+            q = "SELECT e.*, c.name as class_name FROM schedule_events e LEFT JOIN classes c ON e.class_id = c.id WHERE e.teacher_id = $1"
+            params: list = [uuid.UUID(teacher_id)]
+            idx = 2
+            if start_date:
+                q += f" AND e.date >= ${idx}"
+                params.append(start_date)
+                idx += 1
+            if end_date:
+                q += f" AND e.date <= ${idx}"
+                params.append(end_date)
+                idx += 1
+            
+            q += " ORDER BY e.date ASC, e.start_time ASC"
+            
+            async with self.connection() as conn:
+                rows = await conn.fetch(q, *params)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting schedule events for teacher {teacher_id}: {e}")
+            return []
+
+    async def get_schedule_event(self, event_id: str, teacher_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    "SELECT * FROM schedule_events WHERE id = $1 AND teacher_id = $2",
+                    uuid.UUID(event_id), uuid.UUID(teacher_id)
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting schedule event {event_id}: {e}")
+            return None
+
+    async def update_schedule_event(self, event_id: str, teacher_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        try:
+            set_clauses = []
+            values = []
+            idx = 1
+            for key, value in data.items():
+                if key in ["title", "description", "date", "start_time", "end_time", "type", "class_id", "is_all_day"]:
+                    if key == "class_id" and value:
+                        value = uuid.UUID(value)
+                    set_clauses.append(f"{key} = ${idx}")
+                    values.append(value)
+                    idx += 1
+            
+            if not set_clauses:
+                return await self.get_schedule_event(event_id, teacher_id)
+            
+            values.append(uuid.UUID(event_id))
+            values.append(uuid.UUID(teacher_id))
+            
+            query = f"UPDATE schedule_events SET {', '.join(set_clauses)} WHERE id = ${idx} AND teacher_id = ${idx+1} RETURNING *"
+            
+            async with self.connection() as conn:
+                row = await conn.fetchrow(query, *values)
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error updating schedule event {event_id}: {e}")
+            return None
+
+    async def delete_schedule_event(self, event_id: str, teacher_id: str) -> bool:
+        try:
+            async with self.connection() as conn:
+                res = await conn.execute(
+                    "DELETE FROM schedule_events WHERE id = $1 AND teacher_id = $2",
+                    uuid.UUID(event_id), uuid.UUID(teacher_id)
+                )
+                return res.split(" ")[-1] == "1"
+        except Exception as e:
+            logger.error(f"Error deleting schedule event {event_id}: {e}")
+            return False
+
+    # ==================== Attendance Operations ====================
+
+    async def get_attendance_records(self, teacher_id: str, class_id: str, subject_id: str, date: str) -> List[Dict[str, Any]]:
+        try:
+            from datetime import datetime
+            q = "SELECT * FROM attendance_records WHERE teacher_id = $1 AND class_id = $2 AND subject_id = $3 AND date = $4"
+            params: list = [uuid.UUID(teacher_id), uuid.UUID(class_id), uuid.UUID(subject_id), datetime.strptime(date, "%Y-%m-%d").date()]
+            async with self.connection() as conn:
+                rows = await conn.fetch(q, *params)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting attendance: {e}")
+            return []
+
+    async def upsert_attendance_record(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        try:
+            from datetime import datetime
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO attendance_records (teacher_id, class_id, subject_id, student_id, date, status, remarks)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (class_id, subject_id, student_id, date) DO UPDATE 
+                    SET status = EXCLUDED.status, remarks = EXCLUDED.remarks, updated_at = NOW()
+                    RETURNING *
+                    """,
+                    uuid.UUID(data["teacher_id"]),
+                    uuid.UUID(data["class_id"]),
+                    uuid.UUID(data["subject_id"]),
+                    uuid.UUID(data["student_id"]),
+                    datetime.strptime(data["date"], "%Y-%m-%d").date(),
+                    data["status"],
+                    data.get("remarks")
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error upserting attendance: {e}")
+            return None
 
 # Global instance
 _database_service: Optional[DatabaseService] = None
