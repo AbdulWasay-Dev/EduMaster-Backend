@@ -462,6 +462,39 @@ class DatabaseService:
         UNIQUE(class_id, subject_id, student_id, date)
     );
 
+    -- ==================== Email Integration Tables ====================
+
+    CREATE TABLE IF NOT EXISTS email_integrations (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        teacher_id UUID REFERENCES teachers(id) ON DELETE CASCADE NOT NULL UNIQUE,
+        email_address TEXT NOT NULL,
+        imap_host TEXT NOT NULL DEFAULT 'imap.gmail.com',
+        imap_port INTEGER NOT NULL DEFAULT 993,
+        app_password TEXT NOT NULL,
+        is_active BOOLEAN DEFAULT TRUE,
+        last_fetched_at TIMESTAMP WITH TIME ZONE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS email_submission_logs (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        teacher_id UUID REFERENCES teachers(id) ON DELETE CASCADE NOT NULL,
+        assignment_id UUID REFERENCES assignments(id) ON DELETE SET NULL,
+        student_account_id UUID REFERENCES student_accounts(id) ON DELETE SET NULL,
+        email_from TEXT,
+        email_subject TEXT,
+        email_body TEXT,
+        attachment_paths JSONB DEFAULT '[]',
+        processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        status TEXT DEFAULT 'processed' CHECK (status IN ('processed', 'failed', 'skipped')),
+        notes TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_email_integrations_teacher ON email_integrations(teacher_id);
+    CREATE INDEX IF NOT EXISTS idx_email_logs_teacher ON email_submission_logs(teacher_id);
+    CREATE INDEX IF NOT EXISTS idx_email_logs_assignment ON email_submission_logs(assignment_id);
+
     CREATE INDEX IF NOT EXISTS idx_attendance_teacher ON attendance_records(teacher_id);
     CREATE INDEX IF NOT EXISTS idx_attendance_student ON attendance_records(student_id);
     CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_records(date);
@@ -1959,6 +1992,516 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Error upserting attendance: {e}")
             return None
+
+    async def get_attendance_range(self, teacher_id: str, class_id: str, subject_id: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
+        """Get all attendance records in a date range, joining student names."""
+        try:
+            from datetime import datetime
+            async with self.connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT ar.*, s.student_name, s.student_id AS roll_number
+                    FROM attendance_records ar
+                    JOIN students s ON ar.student_id = s.id
+                    WHERE ar.teacher_id = $1 AND ar.class_id = $2 AND ar.subject_id = $3
+                      AND ar.date BETWEEN $4 AND $5
+                    ORDER BY ar.date DESC, s.student_name
+                    """,
+                    uuid.UUID(teacher_id),
+                    uuid.UUID(class_id),
+                    uuid.UUID(subject_id),
+                    datetime.strptime(start_date, "%Y-%m-%d").date(),
+                    datetime.strptime(end_date, "%Y-%m-%d").date(),
+                )
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting attendance range: {e}")
+            return []
+
+    async def get_attendance_history(self, teacher_id: str, class_id: str, subject_id: str, limit: int = 30) -> List[Dict[str, Any]]:
+        """Return recent distinct session dates with per-date status counts."""
+        try:
+            async with self.connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        date,
+                        COUNT(*) FILTER (WHERE status = 'present') AS present,
+                        COUNT(*) FILTER (WHERE status = 'absent')  AS absent,
+                        COUNT(*) FILTER (WHERE status = 'late')    AS late,
+                        COUNT(*) FILTER (WHERE status = 'excused') AS excused,
+                        COUNT(*) AS total
+                    FROM attendance_records
+                    WHERE teacher_id = $1 AND class_id = $2 AND subject_id = $3
+                    GROUP BY date
+                    ORDER BY date DESC
+                    LIMIT $4
+                    """,
+                    uuid.UUID(teacher_id),
+                    uuid.UUID(class_id),
+                    uuid.UUID(subject_id),
+                    limit,
+                )
+                result = []
+                for row in rows:
+                    d = dict(row)
+                    d["date"] = str(d["date"])
+                    total = d["total"] or 1
+                    d["attendance_rate"] = round((d["present"] + d["late"]) / total * 100, 1)
+                    result.append(d)
+                return result
+        except Exception as e:
+            logger.error(f"Error getting attendance history: {e}")
+            return []
+
+    async def get_class_attendance_analytics(self, teacher_id: str, class_id: str, subject_id: str, start_date: str, end_date: str) -> Dict[str, Any]:
+        """Comprehensive class-level analytics for a date range."""
+        try:
+            from datetime import datetime
+            s_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+            e_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+            tid = uuid.UUID(teacher_id)
+            cid = uuid.UUID(class_id)
+            sid = uuid.UUID(subject_id)
+
+            async with self.connection() as conn:
+                # Overall totals
+                totals = await conn.fetchrow(
+                    """
+                    SELECT
+                        COUNT(*) AS total_records,
+                        COUNT(*) FILTER (WHERE status = 'present') AS present,
+                        COUNT(*) FILTER (WHERE status = 'absent')  AS absent,
+                        COUNT(*) FILTER (WHERE status = 'late')    AS late,
+                        COUNT(*) FILTER (WHERE status = 'excused') AS excused,
+                        COUNT(DISTINCT date)                       AS total_sessions
+                    FROM attendance_records
+                    WHERE teacher_id = $1 AND class_id = $2 AND subject_id = $3
+                      AND date BETWEEN $4 AND $5
+                    """,
+                    tid, cid, sid, s_date, e_date
+                )
+
+                # Per-date trend
+                trend_rows = await conn.fetch(
+                    """
+                    SELECT
+                        date,
+                        COUNT(*) FILTER (WHERE status = 'present') AS present,
+                        COUNT(*) FILTER (WHERE status = 'absent')  AS absent,
+                        COUNT(*) FILTER (WHERE status = 'late')    AS late,
+                        COUNT(*) FILTER (WHERE status = 'excused') AS excused,
+                        COUNT(*) AS total
+                    FROM attendance_records
+                    WHERE teacher_id = $1 AND class_id = $2 AND subject_id = $3
+                      AND date BETWEEN $4 AND $5
+                    GROUP BY date
+                    ORDER BY date
+                    """,
+                    tid, cid, sid, s_date, e_date
+                )
+
+                # Per-student summary
+                student_rows = await conn.fetch(
+                    """
+                    SELECT
+                        ar.student_id,
+                        s.student_name,
+                        s.student_id AS roll_number,
+                        COUNT(*) FILTER (WHERE ar.status = 'present') AS present,
+                        COUNT(*) FILTER (WHERE ar.status = 'absent')  AS absent,
+                        COUNT(*) FILTER (WHERE ar.status = 'late')    AS late,
+                        COUNT(*) FILTER (WHERE ar.status = 'excused') AS excused,
+                        COUNT(*) AS total
+                    FROM attendance_records ar
+                    JOIN students s ON ar.student_id = s.id
+                    WHERE ar.teacher_id = $1 AND ar.class_id = $2 AND ar.subject_id = $3
+                      AND ar.date BETWEEN $4 AND $5
+                    GROUP BY ar.student_id, s.student_name, s.student_id
+                    ORDER BY s.student_name
+                    """,
+                    tid, cid, sid, s_date, e_date
+                )
+
+            t = dict(totals)
+            total_r = t["total_records"] or 1
+            trend = []
+            for row in trend_rows:
+                d = dict(row)
+                d["date"] = str(d["date"])
+                tot = d["total"] or 1
+                d["rate"] = round((d["present"] + d["late"]) / tot * 100, 1)
+                trend.append(d)
+
+            students = []
+            for row in student_rows:
+                d = dict(row)
+                d["student_id"] = str(d["student_id"])
+                tot = d["total"] or 1
+                d["attendance_pct"] = round((d["present"] + d["late"]) / tot * 100, 1)
+                students.append(d)
+
+            low_attendance = [s for s in students if s["attendance_pct"] < 75]
+
+            return {
+                "total_sessions": t["total_sessions"],
+                "total_records": t["total_records"],
+                "present": t["present"],
+                "absent": t["absent"],
+                "late": t["late"],
+                "excused": t["excused"],
+                "overall_rate": round((t["present"] + t["late"]) / total_r * 100, 1) if total_r else 0,
+                "trend": trend,
+                "students": students,
+                "low_attendance": low_attendance,
+                "start_date": start_date,
+                "end_date": end_date,
+            }
+        except Exception as e:
+            logger.error(f"Error getting class analytics: {e}")
+            return {}
+
+    async def get_student_attendance_analytics(self, teacher_id: str, student_id: str, class_id: str, subject_id: str, start_date: str, end_date: str) -> Dict[str, Any]:
+        """Detailed analytics for a single student."""
+        try:
+            from datetime import datetime
+            s_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+            e_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+            tid = uuid.UUID(teacher_id)
+            stid = uuid.UUID(student_id)
+            cid = uuid.UUID(class_id)
+            sid = uuid.UUID(subject_id)
+
+            async with self.connection() as conn:
+                # Student info
+                student = await conn.fetchrow("SELECT * FROM students WHERE id = $1", stid)
+
+                # Summary totals
+                totals = await conn.fetchrow(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (WHERE status = 'present') AS present,
+                        COUNT(*) FILTER (WHERE status = 'absent')  AS absent,
+                        COUNT(*) FILTER (WHERE status = 'late')    AS late,
+                        COUNT(*) FILTER (WHERE status = 'excused') AS excused,
+                        COUNT(*) AS total
+                    FROM attendance_records
+                    WHERE teacher_id = $1 AND student_id = $2 AND class_id = $3 AND subject_id = $4
+                      AND date BETWEEN $5 AND $6
+                    """,
+                    tid, stid, cid, sid, s_date, e_date
+                )
+
+                # All records
+                records = await conn.fetch(
+                    """
+                    SELECT date, status, remarks
+                    FROM attendance_records
+                    WHERE teacher_id = $1 AND student_id = $2 AND class_id = $3 AND subject_id = $4
+                      AND date BETWEEN $5 AND $6
+                    ORDER BY date DESC
+                    """,
+                    tid, stid, cid, sid, s_date, e_date
+                )
+
+                # Monthly breakdown
+                monthly = await conn.fetch(
+                    """
+                    SELECT
+                        TO_CHAR(date, 'YYYY-MM') AS month,
+                        COUNT(*) FILTER (WHERE status = 'present') AS present,
+                        COUNT(*) FILTER (WHERE status = 'absent')  AS absent,
+                        COUNT(*) FILTER (WHERE status = 'late')    AS late,
+                        COUNT(*) FILTER (WHERE status = 'excused') AS excused,
+                        COUNT(*) AS total
+                    FROM attendance_records
+                    WHERE teacher_id = $1 AND student_id = $2 AND class_id = $3 AND subject_id = $4
+                      AND date BETWEEN $5 AND $6
+                    GROUP BY month
+                    ORDER BY month
+                    """,
+                    tid, stid, cid, sid, s_date, e_date
+                )
+
+            t = dict(totals)
+            total = t["total"] or 1
+            attendance_pct = round((t["present"] + t["late"]) / total * 100, 1)
+
+            rec_list = []
+            for r in records:
+                d = dict(r)
+                d["date"] = str(d["date"])
+                rec_list.append(d)
+
+            monthly_list = []
+            for m in monthly:
+                d = dict(m)
+                tot = d["total"] or 1
+                d["rate"] = round((d["present"] + d["late"]) / tot * 100, 1)
+                monthly_list.append(d)
+
+            return {
+                "student_name": student["student_name"] if student else "Unknown",
+                "roll_number": student["student_id"] if student else "",
+                "total_sessions": t["total"],
+                "present": t["present"],
+                "absent": t["absent"],
+                "late": t["late"],
+                "excused": t["excused"],
+                "attendance_pct": attendance_pct,
+                "records": rec_list,
+                "monthly": monthly_list,
+                "start_date": start_date,
+                "end_date": end_date,
+            }
+        except Exception as e:
+            logger.error(f"Error getting student analytics: {e}")
+            return {}
+
+    async def get_attendance_overview(self, teacher_id: str, class_id: str, subject_id: str) -> Dict[str, Any]:
+        """High-level overview: heatmap data, overall stats, alerts."""
+        try:
+            from datetime import date, timedelta
+            tid = uuid.UUID(teacher_id)
+            cid = uuid.UUID(class_id)
+            sid = uuid.UUID(subject_id)
+            today = date.today()
+            twelve_weeks_ago = today - timedelta(weeks=12)
+
+            async with self.connection() as conn:
+                # Totals ever
+                totals = await conn.fetchrow(
+                    """
+                    SELECT
+                        COUNT(DISTINCT date) AS total_sessions,
+                        COUNT(*) FILTER (WHERE status = 'present') AS present,
+                        COUNT(*) FILTER (WHERE status = 'absent')  AS absent,
+                        COUNT(*) FILTER (WHERE status = 'late')    AS late,
+                        COUNT(*) FILTER (WHERE status = 'excused') AS excused,
+                        COUNT(*) AS total_records
+                    FROM attendance_records
+                    WHERE teacher_id = $1 AND class_id = $2 AND subject_id = $3
+                    """,
+                    tid, cid, sid
+                )
+
+                # Heatmap: daily counts for last 12 weeks
+                heatmap_rows = await conn.fetch(
+                    """
+                    SELECT
+                        date,
+                        COUNT(*) FILTER (WHERE status IN ('present', 'late')) AS attended,
+                        COUNT(*) AS total
+                    FROM attendance_records
+                    WHERE teacher_id = $1 AND class_id = $2 AND subject_id = $3
+                      AND date >= $4
+                    GROUP BY date
+                    ORDER BY date
+                    """,
+                    tid, cid, sid, twelve_weeks_ago
+                )
+
+                # Students below 75%
+                low_rows = await conn.fetch(
+                    """
+                    SELECT
+                        ar.student_id,
+                        s.student_name,
+                        COUNT(*) FILTER (WHERE ar.status IN ('present','late')) AS attended,
+                        COUNT(*) AS total
+                    FROM attendance_records ar
+                    JOIN students s ON ar.student_id = s.id
+                    WHERE ar.teacher_id = $1 AND ar.class_id = $2 AND ar.subject_id = $3
+                    GROUP BY ar.student_id, s.student_name
+                    HAVING COUNT(*) > 0
+                    """,
+                    tid, cid, sid
+                )
+
+            t = dict(totals)
+            total_r = t["total_records"] or 1
+
+            heatmap = []
+            for row in heatmap_rows:
+                d = dict(row)
+                d["date"] = str(d["date"])
+                d["rate"] = round(d["attended"] / (d["total"] or 1) * 100, 1)
+                heatmap.append(d)
+
+            at_risk = []
+            for row in low_rows:
+                d = dict(row)
+                d["student_id"] = str(d["student_id"])
+                pct = round(d["attended"] / (d["total"] or 1) * 100, 1)
+                d["attendance_pct"] = pct
+                if pct < 75:
+                    at_risk.append(d)
+
+            at_risk.sort(key=lambda x: x["attendance_pct"])
+
+            return {
+                "total_sessions": t["total_sessions"],
+                "total_records": t["total_records"],
+                "present": t["present"],
+                "absent": t["absent"],
+                "late": t["late"],
+                "excused": t["excused"],
+                "overall_rate": round((t["present"] + t["late"]) / total_r * 100, 1) if total_r else 0,
+                "heatmap": heatmap,
+                "at_risk_students": at_risk,
+                "at_risk_count": len(at_risk),
+            }
+        except Exception as e:
+            logger.error(f"Error getting attendance overview: {e}")
+            return {}
+
+    async def get_student_accounts_by_class(self, class_id: str, verified_only: bool = False) -> List[Dict[str, Any]]:
+        """Get all student accounts for a class"""
+        try:
+            q = "SELECT * FROM student_accounts WHERE class_id = $1"
+            params: list = [uuid.UUID(class_id)]
+            if verified_only:
+                q += " AND is_verified = TRUE"
+            q += " ORDER BY full_name"
+            async with self.connection() as conn:
+                rows = await conn.fetch(q, *params)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting student accounts for class {class_id}: {e}")
+            return []
+
+    # ==================== Email Integration Operations ====================
+
+    async def save_email_config(self, teacher_id: str, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Save or update teacher email integration config"""
+        try:
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO email_integrations (teacher_id, email_address, imap_host, imap_port, app_password, is_active)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (teacher_id) DO UPDATE SET
+                        email_address = EXCLUDED.email_address,
+                        imap_host = EXCLUDED.imap_host,
+                        imap_port = EXCLUDED.imap_port,
+                        app_password = EXCLUDED.app_password,
+                        is_active = EXCLUDED.is_active,
+                        updated_at = NOW()
+                    RETURNING *
+                    """,
+                    uuid.UUID(teacher_id),
+                    config["email_address"],
+                    config.get("imap_host", "imap.gmail.com"),
+                    config.get("imap_port", 993),
+                    config["app_password"],
+                    config.get("is_active", True),
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error saving email config for teacher {teacher_id}: {e}")
+            return None
+
+    async def get_email_config(self, teacher_id: str) -> Optional[Dict[str, Any]]:
+        """Get teacher email integration config"""
+        try:
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    "SELECT * FROM email_integrations WHERE teacher_id = $1",
+                    uuid.UUID(teacher_id),
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting email config for teacher {teacher_id}: {e}")
+            return None
+
+    async def create_email_submission_log(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Log a processed email submission"""
+        try:
+            lid = data.get("id") or str(uuid.uuid4())
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO email_submission_logs
+                        (id, teacher_id, assignment_id, student_account_id, email_from,
+                         email_subject, email_body, attachment_paths, processed_at, status, notes)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                    RETURNING *
+                    """,
+                    uuid.UUID(lid),
+                    uuid.UUID(data["teacher_id"]),
+                    uuid.UUID(data["assignment_id"]) if data.get("assignment_id") else None,
+                    uuid.UUID(data["student_account_id"]) if data.get("student_account_id") else None,
+                    data.get("email_from"),
+                    data.get("email_subject"),
+                    data.get("email_body"),
+                    json.dumps(data.get("attachment_paths", [])),
+                    data.get("processed_at"),
+                    data.get("status", "processed"),
+                    data.get("notes"),
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error creating email submission log: {e}")
+            return None
+
+    async def get_email_submission_logs(self, teacher_id: str, assignment_id: str = None) -> List[Dict[str, Any]]:
+        """Get email submission logs for a teacher"""
+        try:
+            q = "SELECT * FROM email_submission_logs WHERE teacher_id = $1"
+            params: list = [uuid.UUID(teacher_id)]
+            if assignment_id:
+                q += " AND assignment_id = $2"
+                params.append(uuid.UUID(assignment_id))
+            q += " ORDER BY processed_at DESC"
+            async with self.connection() as conn:
+                rows = await conn.fetch(q, *params)
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting email submission logs: {e}")
+            return []
+
+    async def get_students_attendance_summary(self, teacher_id: str, class_id: str, subject_id: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
+        """Per-student attendance summary with percentage."""
+        try:
+            from datetime import datetime
+            s_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+            e_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+            async with self.connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        ar.student_id,
+                        s.student_name,
+                        s.student_id AS roll_number,
+                        COUNT(*) FILTER (WHERE ar.status = 'present') AS present,
+                        COUNT(*) FILTER (WHERE ar.status = 'absent')  AS absent,
+                        COUNT(*) FILTER (WHERE ar.status = 'late')    AS late,
+                        COUNT(*) FILTER (WHERE ar.status = 'excused') AS excused,
+                        COUNT(*) AS total
+                    FROM attendance_records ar
+                    JOIN students s ON ar.student_id = s.id
+                    WHERE ar.teacher_id = $1 AND ar.class_id = $2 AND ar.subject_id = $3
+                      AND ar.date BETWEEN $4 AND $5
+                    GROUP BY ar.student_id, s.student_name, s.student_id
+                    ORDER BY s.student_name
+                    """,
+                    uuid.UUID(teacher_id),
+                    uuid.UUID(class_id),
+                    uuid.UUID(subject_id),
+                    s_date,
+                    e_date,
+                )
+                result = []
+                for row in rows:
+                    d = dict(row)
+                    d["student_id"] = str(d["student_id"])
+                    tot = d["total"] or 1
+                    d["attendance_pct"] = round((d["present"] + d["late"]) / tot * 100, 1)
+                    result.append(d)
+                return result
+        except Exception as e:
+            logger.error(f"Error getting students summary: {e}")
+            return []
 
 # Global instance
 _database_service: Optional[DatabaseService] = None

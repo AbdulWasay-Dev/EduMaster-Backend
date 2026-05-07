@@ -79,11 +79,18 @@ async def create_subject(
 
 
 @router.get("/", response_model=List[SubjectResponse])
-async def list_subjects(current_user: dict = Depends(require_teacher())):
-    """List user's subjects"""
+async def list_subjects(
+    class_id: Optional[str] = None,
+    current_user: dict = Depends(require_teacher())
+):
+    """List user's subjects, optionally filtered by class_id"""
     try:
         db = await get_database()
         subjects = await db.get_subjects(current_user["id"])
+
+        # Filter by class_id if provided
+        if class_id:
+            subjects = [s for s in subjects if str(s.get("class_id", "") or "") == class_id]
         
         return [
             SubjectResponse(
