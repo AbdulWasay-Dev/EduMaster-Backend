@@ -85,18 +85,26 @@ async def list_subjects(
 ):
     """List user's subjects, optionally filtered by class_id"""
     try:
+        import uuid as _uuid
         db = await get_database()
-        subjects = await db.get_subjects(current_user["id"])
 
-        # Filter by class_id if provided
+        # Query DB directly with class_id filter when provided
         if class_id:
-            subjects = [s for s in subjects if str(s.get("class_id", "") or "") == class_id]
-        
+            async with db.connection() as conn:
+                rows = await conn.fetch(
+                    "SELECT * FROM subjects WHERE teacher_id = $1 AND class_id = $2 ORDER BY name",
+                    _uuid.UUID(current_user["id"]),
+                    _uuid.UUID(class_id),
+                )
+            subjects = [dict(r) for r in rows]
+        else:
+            subjects = await db.get_subjects(current_user["id"])
+
         return [
             SubjectResponse(
                 id=str(subject["id"]),
                 name=subject["name"],
-                description=subject.get("description", ""),
+                description=subject.get("description", "") or "",
                 teacher_id=str(subject["teacher_id"]) if subject.get("teacher_id") else None,
                 class_id=str(subject["class_id"]) if subject.get("class_id") else None,
                 is_active=subject.get("is_active", True),
@@ -107,7 +115,7 @@ async def list_subjects(
             )
             for subject in subjects
         ]
-        
+
     except Exception as e:
         logger.error(f"Error listing subjects: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
