@@ -408,9 +408,27 @@ async def process_document_async(document_id: str):
         
         # Update status to completed
         await db.update_document_status(document_id, "completed")
-        
+
+        # Fire notification
+        try:
+            from services.notification_service import notify
+            await notify(
+                teacher_id=str(document["owner_id"]),
+                title="Document processed",
+                message=f'"{document["original_filename"]}" has finished processing — {len(chunks_data)} content chunks ready for AI.',
+                notification_type="document_processed",
+                metadata={
+                    "document_id": document_id,
+                    "filename": document.get("original_filename", ""),
+                    "subject_id": str(document.get("subject_id", "")),
+                    "chunk_count": len(chunks_data),
+                },
+            )
+        except Exception:
+            pass
+
         logger.info(f"Document {document_id} processed successfully")
-        
+
     except Exception as e:
         logger.error(f"Error processing document {document_id}: {e}")
         # Update status to failed

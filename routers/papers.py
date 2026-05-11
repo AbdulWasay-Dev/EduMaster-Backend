@@ -357,7 +357,20 @@ async def generate_paper(
                 status_code=500,
                 detail="Failed to create paper"
             )
-        
+
+        # Fire notification
+        try:
+            from services.notification_service import notify
+            await notify(
+                teacher_id=current_teacher["id"],
+                title="Paper generated",
+                message=f'"{request.title}" has been created with {len(questions)} questions ({total_marks} marks).',
+                notification_type="paper_assigned",
+                metadata={"paper_id": str(paper["id"]), "paper_title": request.title, "total_marks": total_marks},
+            )
+        except Exception:
+            pass
+
         return PaperResponse(**_serialize_paper(paper))
 
     except HTTPException:
@@ -617,7 +630,20 @@ async def publish_paper(
                 status_code=500,
                 detail="Failed to publish paper"
             )
-        
+
+        # Fire notification
+        try:
+            from services.notification_service import notify
+            await notify(
+                teacher_id=current_teacher["id"],
+                title="Paper published",
+                message=f'"{paper["title"]}" is now published and ready to distribute.',
+                notification_type="paper_published",
+                metadata={"paper_id": paper_id, "paper_title": paper.get("title", "")},
+            )
+        except Exception:
+            pass
+
         return PaperResponse(**_serialize_paper(updated_paper))
         
     except HTTPException:

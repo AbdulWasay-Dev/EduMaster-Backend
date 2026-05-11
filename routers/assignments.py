@@ -319,8 +319,21 @@ async def delete_assignment(assignment_id: str, current_user: dict = Depends(req
 @router.post("/{assignment_id}/publish")
 async def publish_assignment(assignment_id: str, current_user: dict = Depends(require_teacher())):
     db = await get_database()
-    await _own(db, current_user, assignment_id)
+    a = await _own(db, current_user, assignment_id)
     updated = await db.update_assignment(assignment_id, {"status": "published"})
+    # Notify
+    try:
+        from services.notification_service import notify
+        due_str = f" (due {a['due_date'].strftime('%b %d')}" + ")" if a.get("due_date") else ""
+        await notify(
+            teacher_id=current_user["id"],
+            title="Assignment published",
+            message=f'"{a["title"]}" has been published{due_str}. Students can now see and submit it.',
+            notification_type="assignment_published",
+            metadata={"assignment_id": assignment_id, "title": a.get("title", "")},
+        )
+    except Exception:
+        pass
     return _ser(updated)
 
 @router.post("/{assignment_id}/close")
@@ -376,6 +389,21 @@ async def grade_one(assignment_id: str, submission_id: str, current_user: dict =
     await db.update_assignment_submission(submission_id, {"status": "grading"})
     try:
         updated = await _do_grade(db, a, sub)
+        # Notify
+        try:
+            from services.notification_service import notify
+            marks = updated.get("marks_obtained") if updated else None
+            pct = updated.get("percentage") if updated else None
+            detail = f" — {marks}/{a.get('total_marks', '?')} ({round(pct)}%)" if marks is not None and pct is not None else ""
+            await notify(
+                teacher_id=current_user["id"],
+                title="Submission graded",
+                message=f'Submission for "{a["title"]}" graded{detail}.',
+                notification_type="assignment_graded",
+                metadata={"assignment_id": assignment_id, "submission_id": submission_id},
+            )
+        except Exception:
+            pass
         return _ser_sub(updated)
     except Exception as e:
         await db.update_assignment_submission(submission_id, {"status": "submitted"})
@@ -414,6 +442,19 @@ async def grade_all(assignment_id: str, current_user: dict = Depends(require_tea
             logger.error(f"Grade-all failed for {sub['id']}: {e}")
             await db.update_assignment_submission(str(sub["id"]), {"status": "submitted"})
             failed += 1
+    # Notify
+    if graded > 0:
+        try:
+            from services.notification_service import notify
+            await notify(
+                teacher_id=current_user["id"],
+                title="Batch grading complete",
+                message=f'"{a["title"]}" — {graded}/{len(to_grade)} submissions graded' + (f', {failed} failed' if failed else '') + '.',
+                notification_type="assignment_graded",
+                metadata={"assignment_id": assignment_id, "graded": graded, "failed": failed},
+            )
+        except Exception:
+            pass
     return {"graded_count": graded, "failed_count": failed, "total": len(to_grade)}
 
 @router.get("/{assignment_id}/analytics")

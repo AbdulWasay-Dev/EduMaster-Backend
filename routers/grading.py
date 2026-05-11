@@ -133,7 +133,25 @@ async def upload_and_grade_answer_sheet(
             graded_at=result.get("graded_at"),
             created_at=result.get("created_at"),
         )
-        
+
+        # Fire notification
+        try:
+            from services.notification_service import notify
+            _db2 = await get_database()
+            _paper2 = await _db2.get_paper(request.paper_id)
+            _ptitle = (_paper2 or {}).get("title", "Paper")
+            _pct2 = round(result["grade_percentage"])
+            await notify(
+                teacher_id=current_teacher["id"],
+                title="Answer sheet graded",
+                message=f'Answer sheet for "{_ptitle}" graded — {result["total_score"]}/{result.get("max_score", result.get("total_marks", "?"))} ({_pct2}%).',
+                notification_type="grade_available",
+                metadata={"submission_id": str(result["submission_id"]), "paper_id": request.paper_id, "grade_percentage": result["grade_percentage"]},
+            )
+        except Exception:
+            pass
+
+
     except HTTPException:
         raise
     except Exception as e:

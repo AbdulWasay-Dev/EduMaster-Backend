@@ -93,7 +93,21 @@ async def create_schedule_event(
         created_event["created_at"] = created_event["created_at"].isoformat() if hasattr(created_event["created_at"], 'isoformat') else str(created_event["created_at"])
     if created_event.get("updated_at"):
         created_event["updated_at"] = created_event["updated_at"].isoformat() if hasattr(created_event["updated_at"], 'isoformat') else str(created_event["updated_at"])
-        
+
+    # Fire notification
+    try:
+        from services.notification_service import notify
+        repeat_note = " (repeating weekly)" if event.repeat_weekly else ""
+        await notify(
+            teacher_id=current_user["id"],
+            title="Calendar event added",
+            message=f'"{event.title}" scheduled for {event.date} at {event.start_time}{repeat_note}.',
+            notification_type="calendar_event",
+            metadata={"event_id": str(created_event.get("id", "")), "date": event.date, "type": event.type},
+        )
+    except Exception:
+        pass
+
     return created_event
 
 @router.put("/{event_id}", response_model=dict)

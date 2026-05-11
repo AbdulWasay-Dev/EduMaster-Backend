@@ -86,6 +86,36 @@ async def submit_attendance(
         else:
             failed_count += 1
 
+    # Fire notification
+    if success_count > 0:
+        absent_count = sum(1 for e in batch.entries if e.status == "absent")
+        late_count   = sum(1 for e in batch.entries if e.status == "late")
+        summary_parts = []
+        if absent_count:
+            summary_parts.append(f"{absent_count} absent")
+        if late_count:
+            summary_parts.append(f"{late_count} late")
+        summary = f" ({', '.join(summary_parts)})" if summary_parts else ""
+
+        try:
+            from services.notification_service import notify
+            await notify(
+                teacher_id=teacher_id,
+                title="Attendance saved",
+                message=f"Attendance for {batch.date} saved — {success_count} students recorded{summary}.",
+                notification_type="attendance_saved",
+                metadata={
+                    "class_id": batch.class_id,
+                    "subject_id": batch.subject_id,
+                    "date": batch.date,
+                    "total": success_count,
+                    "absent": absent_count,
+                    "late": late_count,
+                },
+            )
+        except Exception:
+            pass
+
     return {
         "status": "success",
         "message": f"Successfully updated {success_count} records.",

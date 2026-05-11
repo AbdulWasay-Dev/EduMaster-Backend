@@ -186,13 +186,16 @@ class DatabaseService:
         user_id UUID REFERENCES teachers(id) ON DELETE CASCADE,
         title TEXT NOT NULL,
         message TEXT NOT NULL,
-        notification_type TEXT NOT NULL CHECK (notification_type IN ('paper_assigned', 'grade_available', 'deadline_reminder', 'document_processed')),
+        notification_type TEXT NOT NULL DEFAULT 'system',
         is_read BOOLEAN DEFAULT FALSE,
         metadata JSONB,
         student_account_id UUID,
         audience TEXT DEFAULT 'teacher',
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
+
+    -- Drop old restrictive CHECK constraint so we can use richer notification types
+    ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_notification_type_check;
 
     -- ==================== Phase 2 Tables ====================
 
@@ -2502,6 +2505,145 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Error getting students summary: {e}")
             return []
+
+    # ==================== Notification Operations ====================
+
+    VALID_NOTIF_TYPES = {
+        'paper_assigned', 'grade_available', 'deadline_reminder',
+        'document_processed', 'attendance_saved', 'student_enrolled',
+        'assignment_published', 'assignment_graded', 'paper_published',
+        'class_created', 'calendar_event', 'system',
+    }
+
+    async def create_notification(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Create a notification for a teacher. Silently drops invalid types."""
+        try:
+            notif_type = data.get("notification_type", "system")
+            if notif_type not in self.VALID_NOTIF_TYPES:
+                notif_type = "system"
+            notif_id = data.get("id") or str(uuid.uuid4())
+            async with self.connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO notifications
+                        (id, user_id, title, message, notification_type, is_read, metadata)
+                    VALUES ($1, $2, $3, $4, $5, FALSE, $6)
+                    RETURNING *
+                    """,
+                    uuid.UUID(notif_id),
+                    uuid.UUID(data["user_id"]),
+                    data["title"],
+                    data.get("message", ""),
+                    notif_type,
+                    json.dumps(data.get("metadata", {})),
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error creating notification: {e}")
+            return None
+
+    async def get_notifications(
+        self,
+        user_id: str,
+        only_unread: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """List notifications for a teacher, newest first."""
+        try:
+            async with self.connection() as conn:
+                where = "WHERE user_id = $1"
+                params: list = [uuid.UUID(user_id)]
+                if only_unread:
+                    where += " AND is_read = FALSE"
+                rows = await conn.fetch(
+                    f"""
+                    SELECT * FROM notifications
+                    {where}
+                    ORDER BY created_at DESC
+                    LIMIT {limit} OFFSET {offset}
+                    """,
+                    *params,
+                )
+                return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(f"Error fetching notifications for {user_id}: {e}")
+            return []
+
+    async def get_unread_count(self, user_id: str) -> int:
+        """Return unread notification count for a teacher."""
+        try:
+            async with self.connection() as conn:
+                val = await conn.fetchval(
+                    "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND is_read = FALSE",
+                    uuid.UUID(user_id),
+                )
+                return int(val or 0)
+        except Exception as e:
+            logger.error(f"Error counting unread notifications: {e}")
+            return 0
+
+    async def mark_notification_read(self, notification_id: str, user_id: str) -> bool:
+        """Mark a single notification as read (scoped to owner)."""
+        try:
+            async with self.connection() as conn:
+                await conn.execute(
+                    "UPDATE notifications SET is_read = TRUE WHERE id = $1 AND user_id = $2",
+                    uuid.UUID(notification_id),
+                    uuid.UUID(user_id),
+                )
+                return True
+        except Exception as e:
+            logger.error(f"Error marking notification {notification_id} read: {e}")
+            return False
+
+    async def mark_all_notifications_read(self, user_id: str) -> int:
+        """Mark all unread notifications as read. Returns affected count."""
+        try:
+            async with self.connection() as conn:
+                result = await conn.execute(
+                    "UPDATE notifications SET is_read = TRUE WHERE user_id = $1 AND is_read = FALSE",
+                    uuid.UUID(user_id),
+                )
+                # result is e.g. "UPDATE 5"
+                try:
+                    return int(result.split()[-1])
+                except Exception:
+                    return 0
+        except Exception as e:
+            logger.error(f"Error marking all notifications read for {user_id}: {e}")
+            return 0
+
+    async def delete_notification(self, notification_id: str, user_id: str) -> bool:
+        """Delete a notification (scoped to owner)."""
+        try:
+            async with self.connection() as conn:
+                await conn.execute(
+                    "DELETE FROM notifications WHERE id = $1 AND user_id = $2",
+                    uuid.UUID(notification_id),
+                    uuid.UUID(user_id),
+                )
+                return True
+        except Exception as e:
+            logger.error(f"Error deleting notification {notification_id}: {e}")
+            return False
+
+    async def delete_all_read_notifications(self, user_id: str) -> int:
+        """Delete all read notifications for a teacher. Returns deleted count."""
+        try:
+            async with self.connection() as conn:
+                result = await conn.execute(
+                    "DELETE FROM notifications WHERE user_id = $1 AND is_read = TRUE",
+                    uuid.UUID(user_id),
+                )
+                try:
+                    return int(result.split()[-1])
+                except Exception:
+                    return 0
+        except Exception as e:
+            logger.error(f"Error clearing read notifications for {user_id}: {e}")
+            return 0
+
 
 # Global instance
 _database_service: Optional[DatabaseService] = None

@@ -90,6 +90,20 @@ async def create_class(
         created = await db.create_class(payload)
         if not created:
             raise HTTPException(status_code=500, detail="Failed to create class")
+
+        # Fire notification
+        try:
+            from services.notification_service import notify
+            await notify(
+                teacher_id=current_user["id"],
+                title="Class created",
+                message=f'Class "{class_data.name}" has been created and is ready for students.',
+                notification_type="class_created",
+                metadata={"class_id": str(created["id"]), "class_name": class_data.name},
+            )
+        except Exception:
+            pass
+
         return ClassResponse(
             id=str(created["id"]),
             name=created["name"],
