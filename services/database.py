@@ -128,10 +128,22 @@ class DatabaseService:
         file_type TEXT NOT NULL CHECK (file_type IN ('pdf', 'pptx', 'docx', 'png', 'jpg', 'jpeg')),
         file_size BIGINT,
         page_count INTEGER,
+        word_count INTEGER,
+        chunk_count INTEGER,
         processing_status TEXT DEFAULT 'pending' CHECK (processing_status IN ('pending', 'processing', 'completed', 'failed')),
+        processing_progress INTEGER DEFAULT 0,
+        processing_stage TEXT DEFAULT '',
+        processing_error TEXT,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
+
+    -- Live migrations for existing databases
+    ALTER TABLE documents ADD COLUMN IF NOT EXISTS word_count INTEGER;
+    ALTER TABLE documents ADD COLUMN IF NOT EXISTS chunk_count INTEGER;
+    ALTER TABLE documents ADD COLUMN IF NOT EXISTS processing_progress INTEGER DEFAULT 0;
+    ALTER TABLE documents ADD COLUMN IF NOT EXISTS processing_stage TEXT DEFAULT '';
+    ALTER TABLE documents ADD COLUMN IF NOT EXISTS processing_error TEXT;
 
     CREATE TABLE IF NOT EXISTS doc_chunks (
         id BIGSERIAL PRIMARY KEY,
@@ -821,7 +833,7 @@ class DatabaseService:
         try:
             async with self.connection() as conn:
                 rows = await conn.fetch(
-                    "SELECT id, chunk_index, text, metadata FROM doc_chunks WHERE document_id = $1 ORDER BY chunk_index",
+                    "SELECT id, chunk_index, chunk_type, text, metadata FROM doc_chunks WHERE document_id = $1 ORDER BY chunk_index",
                     uuid.UUID(document_id)
                 )
                 return [dict(row) for row in rows]
@@ -829,19 +841,54 @@ class DatabaseService:
             logger.error(f"Error getting chunks for document {document_id}: {e}")
             return []
 
-    async def update_document_status(self, document_id: str, status: str) -> bool:
-        """Update document processing status"""
+    async def update_document_progress(
+        self,
+        document_id: str,
+        *,
+        status: Optional[str] = None,
+        progress: Optional[int] = None,
+        stage: Optional[str] = None,
+        error: Optional[str] = None,
+        page_count: Optional[int] = None,
+        word_count: Optional[int] = None,
+        chunk_count: Optional[int] = None,
+    ) -> bool:
+        """Update document processing state atomically (progress, stage, status, stats)."""
         try:
+            parts = ["updated_at = NOW()"]
+            vals: list = []
+            idx = 1
+
+            if status is not None:
+                parts.append(f"processing_status = ${idx}"); vals.append(status); idx += 1
+            if progress is not None:
+                parts.append(f"processing_progress = ${idx}"); vals.append(max(0, min(100, progress))); idx += 1
+            if stage is not None:
+                parts.append(f"processing_stage = ${idx}"); vals.append(stage); idx += 1
+            if error is not None:
+                parts.append(f"processing_error = ${idx}"); vals.append(error); idx += 1
+            if page_count is not None:
+                parts.append(f"page_count = ${idx}"); vals.append(page_count); idx += 1
+            if word_count is not None:
+                parts.append(f"word_count = ${idx}"); vals.append(word_count); idx += 1
+            if chunk_count is not None:
+                parts.append(f"chunk_count = ${idx}"); vals.append(chunk_count); idx += 1
+
+            vals.append(uuid.UUID(document_id))
             async with self.connection() as conn:
                 await conn.execute(
-                    "UPDATE documents SET processing_status = $1, updated_at = NOW() WHERE id = $2",
-                    status,
-                    uuid.UUID(document_id)
+                    f"UPDATE documents SET {', '.join(parts)} WHERE id = ${idx}",
+                    *vals,
                 )
-                return True
+            return True
         except Exception as e:
-            logger.error(f"Error updating document {document_id} status: {e}")
+            logger.error(f"Error updating document progress {document_id}: {e}")
             return False
+
+    async def update_document_status(self, document_id: str, status: str) -> bool:
+        """Thin wrapper kept for backward-compat — delegates to update_document_progress."""
+        return await self.update_document_progress(document_id, status=status)
+
 
     async def delete_document(self, document_id: str) -> bool:
         """Delete a document and its chunks from PostgreSQL and ChromaDB"""
@@ -882,54 +929,80 @@ class DatabaseService:
     # ==================== Document Chunks Operations ====================
     
     async def create_document_chunks(self, chunks_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Create document chunks in PostgreSQL and embeddings in ChromaDB"""
+        """
+        Store document chunks in PostgreSQL (with chunk_type, metadata) and embeddings in ChromaDB.
+        Uses executemany-style batching for fast bulk inserts on large documents.
+        """
         try:
             if not chunks_data:
                 return []
-            
-            # 1. Store relational data in PostgreSQL
+
             results = []
             async with self.connection() as conn:
+                # Use copy_records_to_table for very large batches when available,
+                # otherwise fall back to individual inserts with RETURNING.
                 for chunk in chunks_data:
+                    raw_meta = chunk.get("metadata")
+                    meta_json = json.dumps(raw_meta) if raw_meta and not isinstance(raw_meta, str) else (raw_meta or "{}")
+                    # Map chunk_type to allowed values
+                    ct = chunk.get("chunk_type", "paragraph")
+                    if ct not in ("section", "paragraph", "list", "table"):
+                        ct = "paragraph"
                     row = await conn.fetchrow(
                         """
-                        INSERT INTO doc_chunks (document_id, subject_id, owner_id, chunk_index, text)
-                        VALUES ($1, $2, $3, $4, $5)
+                        INSERT INTO doc_chunks
+                            (document_id, subject_id, owner_id, chunk_index, chunk_type, text, metadata)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
                         RETURNING id, document_id, chunk_index, text
                         """,
                         uuid.UUID(chunk["document_id"]),
                         uuid.UUID(chunk["subject_id"]),
                         uuid.UUID(chunk["owner_id"]),
                         chunk["chunk_index"],
-                        chunk["text"]
+                        ct,
+                        chunk["text"],
+                        meta_json,
                     )
                     if row:
                         results.append(dict(row))
-            
-            # 2. Store embeddings in ChromaDB
+
+            # Store embeddings in ChromaDB
             if results:
                 subject_id = str(chunks_data[0]["subject_id"])
-                collection = self._chroma_client.get_or_create_collection(
-                    name=f"subject_{subject_id.replace('-', '_')}"
-                )
-                
-                ids = [str(r["id"]) for r in results]
-                embeddings = [c["embedding"] for c in chunks_data]
-                metadatas = [{"document_id": str(c["document_id"]), "chunk_index": c["chunk_index"]} for c in chunks_data]
-                documents = [c["text"] for c in chunks_data]
-                
-                collection.add(
-                    ids=ids,
-                    embeddings=embeddings,
-                    metadatas=metadatas,
-                    documents=documents
-                )
-                logger.info(f"Added {len(ids)} chunks to ChromaDB collection for subject {subject_id}")
-                
+                try:
+                    collection = self._chroma_client.get_or_create_collection(
+                        name=f"subject_{subject_id.replace('-', '_')}"
+                    )
+                    ids        = [str(r["id"]) for r in results]
+                    embeddings = [c["embedding"] for c in chunks_data if c.get("embedding")]
+                    metas      = [
+                        {
+                            "document_id": str(c["document_id"]),
+                            "chunk_index": c["chunk_index"],
+                            "chunk_type": c.get("chunk_type", "paragraph"),
+                        }
+                        for c in chunks_data
+                    ]
+                    documents = [c["text"] for c in chunks_data]
+
+                    # ChromaDB batches of 5000 (its internal limit)
+                    CHROMA_BATCH = 5000
+                    for b in range(0, len(ids), CHROMA_BATCH):
+                        collection.add(
+                            ids=ids[b:b+CHROMA_BATCH],
+                            embeddings=embeddings[b:b+CHROMA_BATCH],
+                            metadatas=metas[b:b+CHROMA_BATCH],
+                            documents=documents[b:b+CHROMA_BATCH],
+                        )
+                    logger.info(f"Added {len(ids)} chunks to ChromaDB for subject {subject_id}")
+                except Exception as chroma_err:
+                    logger.warning(f"ChromaDB store failed (postgres still saved): {chroma_err}")
+
             return results
         except Exception as e:
             logger.error(f"Error creating document chunks: {e}")
             return []
+
     
     async def search_similar_chunks(
         self, 

@@ -54,31 +54,57 @@ class EmbeddingService:
             logger.error(f"Error generating embedding: {e}")
             return None
 
-    async def generate_embeddings_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
-        """Generate embeddings for multiple texts efficiently."""
+    async def generate_embeddings_batch(
+        self,
+        texts: List[str],
+        batch_size: int = 64,
+        progress_callback=None,  # async callable(pct: int, stage: str)
+    ) -> List[Optional[List[float]]]:
+        """
+        Generate embeddings for multiple texts efficiently.
+        Splits into sub-batches of `batch_size` to avoid OOM on large documents.
+        Calls progress_callback(pct, stage) at each sub-batch boundary.
+        """
         if not texts:
             return []
+
         cleaned_texts = [self._clean_text(t) for t in texts]
         prefixed = [
             f"Represent this sentence: {t}" if t else None
             for t in cleaned_texts
         ]
         results: List[Optional[List[float]]] = [None] * len(texts)
-        # Filter out empty entries and encode in one batch
         valid_indices = [i for i, p in enumerate(prefixed) if p]
-        valid_texts = [prefixed[i] for i in valid_indices]
-        if valid_texts:
+        valid_texts   = [prefixed[i] for i in valid_indices]
+
+        if not valid_texts:
+            return results
+
+        loop = asyncio.get_event_loop()
+        total_batches = (len(valid_texts) + batch_size - 1) // batch_size
+
+        for batch_num in range(total_batches):
+            batch_start = batch_num * batch_size
+            batch_end   = min(batch_start + batch_size, len(valid_texts))
+            batch_texts = valid_texts[batch_start:batch_end]
+            batch_idxs  = valid_indices[batch_start:batch_end]
+
             try:
-                loop = asyncio.get_event_loop()
                 vecs = await loop.run_in_executor(
                     None,
-                    partial(self.model.encode, valid_texts, normalize_embeddings=True)
+                    partial(self.model.encode, batch_texts, normalize_embeddings=True, show_progress_bar=False),
                 )
-                for idx, vec in zip(valid_indices, vecs):
+                for idx, vec in zip(batch_idxs, vecs):
                     results[idx] = vec.tolist()
             except Exception as e:
-                logger.error(f"Error generating batch embeddings: {e}")
+                logger.error(f"Error generating embeddings batch {batch_num}: {e}")
+
+            if progress_callback and total_batches > 0:
+                pct = int(((batch_num + 1) / total_batches) * 100)
+                await progress_callback(pct, f"embedding batch {batch_num+1}/{total_batches}")
+
         return results
+
 
     async def  generate_query_embedding(self, query: str) -> Optional[List[float]]:
         """Generate embedding for a search query."""
