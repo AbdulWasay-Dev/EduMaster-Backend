@@ -1,0 +1,66 @@
+# ── Python artefacts ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+env/
+ENV/
+.venv/
+
+# ── Secrets – never copy into image ──────────────────────────────────────────
+.env
+.env.*
+!.env.example          # keep the example template
+!.env.docker.example   # keep the docker template
+
+# ── Local data / caches ───────────────────────────────────────────────────────
+chroma_db/
+uploads/
+logs/
+.cache/
+*.log
+
+# ── Tests & debug scripts ─────────────────────────────────────────────────────
+check_*.py
+debug_*.py
+quick_*.py
+test_*.py
+example_*.py
+fix*.py
+patch_*.py
+setup_*.py
+create_*.py
+install_*.py
+init_*.py
+reset_*.py
+run_server.bat
+
+# ── IDE / OS ─────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ── Git ───────────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Docs & markdown ───────────────────────────────────────────────────────────
+*.md
+docs/
+
+# ── Docker files themselves (no need to copy into the image) ──────────────────
+Dockerfile
+docker-compose.yml
+.dockerignore

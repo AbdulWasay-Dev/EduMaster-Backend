@@ -1,0 +1,84 @@
+# =============================================================================
+# EduMaster Backend – docker-compose.yml
+# =============================================================================
+# This file runs ONLY the backend container.
+# PostgreSQL and Redis live outside Docker and are wired in via .env.docker.
+#
+# Usage:
+#   cp .env.docker.example .env.docker   # fill in your real values
+#   docker compose up --build -d
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Backend – FastAPI application
+  # ---------------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Cache-bust the model download layer only when requirements change
+      args:
+        BUILDKIT_INLINE_CACHE: "1"
+    image: edumaster-backend:latest
+    container_name: edumaster_backend
+
+    # Load all secrets / connection strings from the env file
+    env_file:
+      - .env.docker
+
+    ports:
+      - "8010:8010"
+
+    volumes:
+      # ChromaDB data – persists vector store between restarts
+      - chroma_data:/app/chroma_db
+      # File uploads – persists uploaded documents
+      - uploads_data:/app/uploads
+      # HuggingFace model cache – avoids re-download on container restart
+      - hf_cache:/app/.cache/huggingface
+      # Torch cache (used by sentence-transformers / torch backend)
+      - torch_cache:/app/.cache/torch
+      # Application logs
+      - ./logs:/app/logs
+
+    restart: unless-stopped
+
+    # Wait a bit before marking healthy; model loading can take ~30s
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8010/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+    # Limit container resources (adjust to your server)
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
+        reservations:
+          memory: 1G
+          cpus: "0.5"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+# ---------------------------------------------------------------------------
+# Named volumes (managed by Docker – survive container recreation)
+# ---------------------------------------------------------------------------
+volumes:
+  chroma_data:
+    driver: local
+  uploads_data:
+    driver: local
+  hf_cache:
+    driver: local
+  torch_cache:
+    driver: local
