@@ -126,18 +126,20 @@ EXPOSE 8010
 USER appuser
 
 # ── 9. Health check ───────────────────────────────────────────────────────────
-HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
-    CMD curl -f http://localhost:8010/health || exit 1
+# start_period=120s: allow time for DB init + embedding model load on cold start
+HEALTHCHECK --interval=30s --timeout=15s --start-period=120s --retries=5 \
+    CMD curl -f http://localhost:${PORT:-8010}/health || exit 1
 
 # ── 10. Startup ───────────────────────────────────────────────────────────────
 # tini as PID-1 ensures proper signal handling and zombie reaping
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
-CMD ["uvicorn", "main:app", \
-     "--host",       "0.0.0.0", \
-     "--port",       "8010", \
-     "--workers",    "2", \
-     "--loop",       "uvloop", \
-     "--http",       "httptools", \
-     "--log-level",  "info", \
-     "--no-access-log"]
+# Railway injects $PORT at runtime — we must bind to it.
+# Fallback to 8010 for local docker run without Railway.
+CMD sh -c "uvicorn main:app \
+    --host 0.0.0.0 \
+    --port ${PORT:-8010} \
+    --workers 1 \
+    --loop uvloop \
+    --http httptools \
+    --log-level info"
