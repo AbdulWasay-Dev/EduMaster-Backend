@@ -60,6 +60,17 @@ logs/
 *.sqlite
 *.sqlite3
 
+# Application runtime data (never commit these)
+uploads/
+chroma_db/
+static/
+.cache/
+
+# Model caches
+*.cache
+*.pt
+*.bin
+
 # Temporary files
 *.tmp
 *.temp
