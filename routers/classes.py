@@ -4,7 +4,8 @@ Classes API endpoints
 import logging
 import string
 import random
-from typing import Optional
+import uuid
+from typing import Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -20,6 +21,7 @@ class ClassCreate(BaseModel):
     name: str
     description: str = ""
     grade_level: Optional[str] = None
+    subject_id: Optional[str] = None
     subject_area: Optional[str] = None
     academic_year: Optional[str] = None
 
@@ -37,6 +39,7 @@ class ClassResponse(BaseModel):
     name: str
     description: str
     grade_level: Optional[str] = None
+    subject_id: Optional[str] = None
     subject_area: Optional[str] = None
     academic_year: Optional[str] = None
     is_active: Optional[bool] = True
@@ -47,12 +50,13 @@ class ClassResponse(BaseModel):
     created_at: str
 
 
-def _class_to_dict(r: dict, fallback_teacher_id: str = None) -> dict:
+def _class_to_dict(r: dict, fallback_teacher_id: str = None, subject_id: str = None) -> dict:
     return {
         "id": str(r["id"]),
         "name": r["name"],
         "description": r.get("description", ""),
         "grade_level": r.get("grade_level"),
+        "subject_id": subject_id,
         "subject_area": r.get("subject_area"),
         "academic_year": r.get("academic_year"),
         "is_active": r.get("is_active", True),
@@ -70,6 +74,53 @@ def _generate_class_code(name: str) -> str:
     return f"{prefix}-{suffix}"
 
 
+async def _get_subject_map_for_teacher(db, teacher_id: str) -> Dict[str, str]:
+    async with db.connection() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT ON (class_id) class_id, id
+            FROM subjects
+            WHERE teacher_id = $1 AND class_id IS NOT NULL
+            ORDER BY class_id, created_at ASC, name ASC
+            """,
+            uuid.UUID(teacher_id),
+        )
+    return {str(row["class_id"]): str(row["id"]) for row in rows}
+
+
+async def _validate_subject_owner(db, subject_id: Optional[str], teacher_id: str) -> Optional[str]:
+    if not subject_id:
+        return None
+    try:
+        subject_uuid = uuid.UUID(subject_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid subject_id")
+
+    async with db.connection() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM subjects WHERE id = $1 AND teacher_id = $2",
+            subject_uuid,
+            uuid.UUID(teacher_id),
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    return str(row["id"])
+
+
+async def _assign_subject_to_class(db, subject_id: str, class_id: str, teacher_id: str) -> None:
+    async with db.connection() as conn:
+        await conn.execute(
+            """
+            UPDATE subjects
+            SET class_id = $1, updated_at = NOW()
+            WHERE id = $2 AND teacher_id = $3
+            """,
+            uuid.UUID(class_id),
+            uuid.UUID(subject_id),
+            uuid.UUID(teacher_id),
+        )
+
+
 @router.post("/", response_model=ClassResponse)
 async def create_class(
     class_data: ClassCreate,
@@ -78,6 +129,7 @@ async def create_class(
     """Create a new class"""
     try:
         db = await get_database()
+        subject_id = await _validate_subject_owner(db, class_data.subject_id, current_user["id"])
         payload = {
             "teacher_id": current_user["id"],
             "name": class_data.name,
@@ -90,6 +142,9 @@ async def create_class(
         created = await db.create_class(payload)
         if not created:
             raise HTTPException(status_code=500, detail="Failed to create class")
+
+        if subject_id:
+            await _assign_subject_to_class(db, subject_id, str(created["id"]), current_user["id"])
 
         # Fire notification
         try:
@@ -104,17 +159,7 @@ async def create_class(
         except Exception:
             pass
 
-        return ClassResponse(
-            id=str(created["id"]),
-            name=created["name"],
-            description=created.get("description", ""),
-            grade_level=created.get("grade_level"),
-            subject_area=created.get("subject_area"),
-            academic_year=created.get("academic_year"),
-            is_active=created.get("is_active", True),
-            teacher_id=str(created["teacher_id"]) if created.get("teacher_id") else str(current_user["id"]),
-            created_at=str(created["created_at"]),
-        )
+        return _class_to_dict(created, current_user["id"], subject_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -128,8 +173,9 @@ async def list_classes(current_user: dict = Depends(require_teacher())):
     try:
         db = await get_database()
         rows = await db.get_classes(current_user["id"])
+        subject_map = await _get_subject_map_for_teacher(db, current_user["id"])
         return {
-            "classes": [_class_to_dict(r, current_user["id"]) for r in rows]
+            "classes": [_class_to_dict(r, current_user["id"], subject_map.get(str(r["id"]))) for r in rows]
         }
     except Exception as e:
         logger.error(f"Error listing classes: {e}")
@@ -156,7 +202,8 @@ async def get_class(
         if not class_obj:
             raise HTTPException(status_code=404, detail="Class not found")
         
-        return _class_to_dict(class_obj, current_user["id"])
+        subject_map = await _get_subject_map_for_teacher(db, current_user["id"])
+        return _class_to_dict(class_obj, current_user["id"], subject_map.get(str(class_obj["id"])))
     except HTTPException:
         raise
     except Exception as e:
@@ -173,6 +220,7 @@ async def update_class(
     """Update a class"""
     try:
         db = await get_database()
+        subject_id = await _validate_subject_owner(db, payload.subject_id, current_user["id"])
         classes = await db.get_classes(current_user["id"])
         class_ids = [str(c["id"]) for c in classes]
         if class_id not in class_ids:
@@ -197,17 +245,12 @@ async def update_class(
             updated = dict(row) if row else None
         if not updated:
             raise HTTPException(status_code=500, detail="Failed to update class")
-        return ClassResponse(
-            id=str(updated["id"]),
-            name=updated["name"],
-            description=updated.get("description", ""),
-            grade_level=updated.get("grade_level"),
-            subject_area=updated.get("subject_area"),
-            academic_year=updated.get("academic_year"),
-            is_active=updated.get("is_active", True),
-            teacher_id=str(updated["teacher_id"]) if updated.get("teacher_id") else str(current_user["id"]),
-            created_at=str(updated["created_at"]),
-        )
+
+        if subject_id:
+            await _assign_subject_to_class(db, subject_id, class_id, current_user["id"])
+
+        subject_map = await _get_subject_map_for_teacher(db, current_user["id"])
+        return _class_to_dict(updated, current_user["id"], subject_id or subject_map.get(str(updated["id"])))
     except HTTPException:
         raise
     except Exception as e:

@@ -2,6 +2,7 @@
 Subjects API endpoints
 """
 import logging
+import uuid
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -11,6 +12,25 @@ from services.database import get_database
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+async def _validate_class_owner(db, class_id: Optional[str], teacher_id: str) -> Optional[str]:
+    if not class_id:
+        return None
+    try:
+        class_uuid = uuid.UUID(class_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid class_id")
+
+    async with db.connection() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM classes WHERE id = $1 AND teacher_id = $2",
+            class_uuid,
+            uuid.UUID(teacher_id),
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Class not found")
+    return str(row["id"])
 
 
 class SubjectCreate(BaseModel):
@@ -46,12 +66,13 @@ async def create_subject(
     """Create a new subject"""
     try:
         db = await get_database()
+        class_id = await _validate_class_owner(db, subject_data.class_id, current_user["id"])
         
         subject_data_dict = {
             "teacher_id": current_user["id"],
             "name": subject_data.name,
             "description": subject_data.description,
-            "class_id": subject_data.class_id
+            "class_id": class_id
         }
         
         subject = await db.create_subject(subject_data_dict)
@@ -85,16 +106,16 @@ async def list_subjects(
 ):
     """List user's subjects, optionally filtered by class_id"""
     try:
-        import uuid as _uuid
         db = await get_database()
+        class_id = await _validate_class_owner(db, class_id, current_user["id"])
 
         # Query DB directly with class_id filter when provided
         if class_id:
             async with db.connection() as conn:
                 rows = await conn.fetch(
                     "SELECT * FROM subjects WHERE teacher_id = $1 AND class_id = $2 ORDER BY name",
-                    _uuid.UUID(current_user["id"]),
-                    _uuid.UUID(class_id),
+                    uuid.UUID(current_user["id"]),
+                    uuid.UUID(class_id),
                 )
             subjects = [dict(r) for r in rows]
         else:
@@ -116,6 +137,8 @@ async def list_subjects(
             for subject in subjects
         ]
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error listing subjects: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -172,8 +195,8 @@ async def update_subject(
             raise HTTPException(status_code=404, detail="Subject not found")
         if str(subject["teacher_id"]) != str(current_user["id"]):
             raise HTTPException(status_code=403, detail="Access denied to this subject")
+        class_id = await _validate_class_owner(db, payload.class_id, current_user["id"])
 
-        import uuid
         async with db.connection() as conn:
             row = await conn.fetchrow(
                 """
@@ -184,7 +207,7 @@ async def update_subject(
                 """,
                 payload.name,
                 payload.description,
-                uuid.UUID(payload.class_id) if payload.class_id else None,
+                uuid.UUID(class_id) if class_id else None,
                 uuid.UUID(subject_id),
             )
             updated = dict(row) if row else None
