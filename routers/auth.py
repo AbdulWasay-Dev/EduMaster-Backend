@@ -82,7 +82,7 @@ class UserProfile(BaseModel):
     default_exam_duration: Optional[str] = None
     default_exam_instructions: Optional[str] = None
     default_student_fields: List[str] = Field(default_factory=lambda: ["name", "roll_number"])
-    default_paper_template: Optional[str] = "classic"
+    default_paper_template: Optional[str] = "formal"
 
 
 TEACHER_PROFILE_FIELDS = [
@@ -143,7 +143,7 @@ def _profile_response(user: dict) -> UserProfile:
         default_exam_duration=user.get("default_exam_duration"),
         default_exam_instructions=user.get("default_exam_instructions"),
         default_student_fields=_parse_student_fields(user.get("default_student_fields")),
-        default_paper_template=user.get("default_paper_template") or "classic",
+        default_paper_template=user.get("default_paper_template") or "formal",
     )
 
 
@@ -214,7 +214,7 @@ async def register_user(user_data: UserRegister):
             "default_exam_duration": user_data.default_exam_duration,
             "default_exam_instructions": user_data.default_exam_instructions,
             "default_student_fields": user_data.default_student_fields or ["name", "roll_number"],
-            "default_paper_template": user_data.default_paper_template or "classic",
+            "default_paper_template": user_data.default_paper_template or "formal",
         }
         
         user = await db.create_teacher(teacher_data)

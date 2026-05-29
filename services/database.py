@@ -59,7 +59,7 @@ class DatabaseService:
         default_exam_duration TEXT,
         default_exam_instructions TEXT,
         default_student_fields JSONB DEFAULT '["name", "roll_number"]',
-        default_paper_template TEXT DEFAULT 'classic',
+        default_paper_template TEXT DEFAULT 'formal',
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
@@ -78,7 +78,7 @@ class DatabaseService:
     ALTER TABLE teachers ADD COLUMN IF NOT EXISTS default_exam_duration TEXT;
     ALTER TABLE teachers ADD COLUMN IF NOT EXISTS default_exam_instructions TEXT;
     ALTER TABLE teachers ADD COLUMN IF NOT EXISTS default_student_fields JSONB DEFAULT '["name", "roll_number"]';
-    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS default_paper_template TEXT DEFAULT 'classic';
+    ALTER TABLE teachers ADD COLUMN IF NOT EXISTS default_paper_template TEXT DEFAULT 'formal';
 
     CREATE TABLE IF NOT EXISTS classes (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -688,7 +688,7 @@ class DatabaseService:
                     teacher_data.get("default_exam_duration"),
                     teacher_data.get("default_exam_instructions"),
                     json.dumps(teacher_data.get("default_student_fields", ["name", "roll_number"])),
-                    teacher_data.get("default_paper_template", "classic")
+                    teacher_data.get("default_paper_template", "formal")
                 )
                 return dict(row) if row else None
         except Exception as e:

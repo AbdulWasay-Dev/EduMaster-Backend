@@ -38,10 +38,17 @@ class PaperGenerationRequest(BaseModel):
 
     # Advanced paper configuration
     question_type_counts: Optional[Dict[str, int]] = Field(None, description="Per-type question counts e.g. {'mcq': 5, 'short_answer': 3, 'essay': 2}")
-    template: Optional[str] = Field(default=None, description="Paper template: classic, university, school, minimalist")
+    template: Optional[str] = Field(default=None, description="Paper template: formal")
     institution_name: Optional[str] = Field(None, description="Institution / school name for the paper header")
+    faculty_name: Optional[str] = Field(None, description="Faculty name for the paper header")
+    department_name: Optional[str] = Field(None, description="Department name for the paper header")
+    program_name: Optional[str] = Field(None, description="Program name displayed on the paper")
+    session_name: Optional[str] = Field(None, description="Session / academic term")
+    logo_left_url: Optional[str] = Field(None, description="Left logo image URL")
+    logo_right_url: Optional[str] = Field(None, description="Right logo image URL")
     teacher_name: Optional[str] = Field(None, description="Teacher name displayed on the paper")
     course_name: Optional[str] = Field(None, description="Course name displayed on the paper")
+    course_code: Optional[str] = Field(None, description="Course code displayed on the paper")
     exam_date: Optional[str] = Field(None, description="Exam date displayed on the paper")
     duration: Optional[str] = Field(None, description="Duration string e.g. '3 Hours'")
     instructions: Optional[str] = Field(None, description="Custom paper instructions")
@@ -73,10 +80,17 @@ class PaperResponse(BaseModel):
     # Extended fields
     duration_minutes: Optional[int] = None
     difficulty_level: str = "medium"
-    template: str = "classic"
+    template: str = "formal"
     institution_name: Optional[str] = None
+    faculty_name: Optional[str] = None
+    department_name: Optional[str] = None
+    program_name: Optional[str] = None
+    session_name: Optional[str] = None
+    logo_left_url: Optional[str] = None
+    logo_right_url: Optional[str] = None
     teacher_name: Optional[str] = None
     course_name: Optional[str] = None
+    course_code: Optional[str] = None
     exam_date: Optional[str] = None
     duration: Optional[str] = None
     instructions: Optional[str] = None
@@ -99,13 +113,28 @@ def _parse_string_list(value: Any, fallback: Optional[List[str]] = None) -> List
     return fallback
 
 
+def _normalize_template_key(value: Optional[str]) -> str:
+    if value == "formal":
+        return "formal"
+    if value in ("classic", "university", "school", "minimalist"):
+        return "formal"
+    return "formal"
+
+
 def _teacher_paper_defaults(teacher: Optional[dict], subject_name: str = "") -> dict:
     teacher = teacher or {}
     return {
-        "template": teacher.get("default_paper_template") or "classic",
+        "template": _normalize_template_key(teacher.get("default_paper_template")),
         "institution_name": teacher.get("school_name") or "EduMaster Institute",
+        "faculty_name": "",
+        "department_name": teacher.get("department") or "",
+        "program_name": "",
+        "session_name": "",
+        "logo_left_url": "",
+        "logo_right_url": "",
         "teacher_name": teacher.get("name") or "Unknown Teacher",
         "course_name": teacher.get("default_course_name") or subject_name,
+        "course_code": "",
         "duration": teacher.get("default_exam_duration") or "3 Hours",
         "instructions": teacher.get("default_exam_instructions")
             or "Answer ALL questions. Marks are indicated against each question.",
@@ -308,11 +337,18 @@ async def generate_paper(
             total_marks += question.get("marks", question.get("max_score", 5))
         
         teacher_defaults = _teacher_paper_defaults(current_teacher, subject_name)
-        resolved_template = request.template or teacher_defaults["template"]
+        resolved_template = _normalize_template_key(request.template or teacher_defaults["template"])
         resolved_student_fields = request.student_fields or teacher_defaults["student_fields"]
         resolved_institution = request.institution_name or teacher_defaults["institution_name"]
+        resolved_faculty = request.faculty_name or teacher_defaults["faculty_name"]
+        resolved_department = request.department_name or teacher_defaults["department_name"]
+        resolved_program = request.program_name or teacher_defaults["program_name"]
+        resolved_session = request.session_name or teacher_defaults["session_name"]
+        resolved_logo_left = request.logo_left_url or teacher_defaults["logo_left_url"]
+        resolved_logo_right = request.logo_right_url or teacher_defaults["logo_right_url"]
         resolved_teacher_name = request.teacher_name or teacher_defaults["teacher_name"]
         resolved_course = request.course_name or teacher_defaults["course_name"]
+        resolved_course_code = request.course_code or teacher_defaults["course_code"]
         resolved_duration = request.duration or teacher_defaults["duration"]
         resolved_instructions = request.instructions or teacher_defaults["instructions"]
 
@@ -333,8 +369,15 @@ async def generate_paper(
                 "time_limit": request.time_limit,
                 "template": resolved_template,
                 "institution_name": resolved_institution,
+                "faculty_name": resolved_faculty,
+                "department_name": resolved_department,
+                "program_name": resolved_program,
+                "session_name": resolved_session,
+                "logo_left_url": resolved_logo_left,
+                "logo_right_url": resolved_logo_right,
                 "teacher_name": resolved_teacher_name,
                 "course_name": resolved_course,
+                "course_code": resolved_course_code,
                 "exam_date": request.exam_date,
                 "duration": resolved_duration,
                 "instructions": resolved_instructions,
@@ -520,8 +563,15 @@ async def create_paper_from_question_sheet(
                 "ocr_text": ocr_text,
                 "template": teacher_defaults["template"],
                 "institution_name": teacher_defaults["institution_name"],
+                "faculty_name": teacher_defaults["faculty_name"],
+                "department_name": teacher_defaults["department_name"],
+                "program_name": teacher_defaults["program_name"],
+                "session_name": teacher_defaults["session_name"],
+                "logo_left_url": teacher_defaults["logo_left_url"],
+                "logo_right_url": teacher_defaults["logo_right_url"],
                 "teacher_name": teacher_defaults["teacher_name"],
                 "course_name": teacher_defaults["course_name"],
+                "course_code": teacher_defaults["course_code"],
                 "duration": teacher_defaults["duration"],
                 "instructions": teacher_defaults["instructions"],
                 "student_fields": teacher_defaults["student_fields"],
@@ -665,7 +715,7 @@ async def export_paper(
 ):
     """
     Export paper in printable format (PDF, HTML, or plain text).
-    Supports 4 PDF templates: classic, university, school, minimalist.
+    Supports the formal PDF template.
     """
     try:
         db = await get_database()
@@ -695,15 +745,24 @@ async def export_paper(
 
         paper_meta = {
             "institution_name": _cfg.get("institution_name") or teacher_defaults["institution_name"],
+            "faculty_name": _cfg.get("faculty_name") or teacher_defaults["faculty_name"],
+            "department_name": _cfg.get("department_name") or teacher_defaults["department_name"],
+            "program_name": _cfg.get("program_name") or teacher_defaults["program_name"],
+            "session_name": _cfg.get("session_name") or teacher_defaults["session_name"],
+            "logo_left_url": _cfg.get("logo_left_url") or teacher_defaults["logo_left_url"],
+            "logo_right_url": _cfg.get("logo_right_url") or teacher_defaults["logo_right_url"],
             "teacher_name": _cfg.get("teacher_name") or teacher_defaults["teacher_name"],
             "course_name": _cfg.get("course_name") or teacher_defaults["course_name"],
+            "course_code": _cfg.get("course_code") or teacher_defaults["course_code"],
             "exam_date": _cfg.get("exam_date", "________________"),
             "duration": _cfg.get("duration") or teacher_defaults["duration"],
             "instructions": _cfg.get("instructions") or teacher_defaults["instructions"],
             "student_fields": _cfg.get("student_fields") or teacher_defaults["student_fields"],
         }
         # Template: query param overrides stored config
-        resolved_template = template_name or _cfg.get("template") or teacher_defaults["template"]
+        resolved_template = _normalize_template_key(
+            template_name or _cfg.get("template") or teacher_defaults["template"]
+        )
 
         # Generate printable content (text fallback)
         printable_content = _generate_printable_content(paper)
@@ -1429,8 +1488,10 @@ async def update_paper_endpoint(
         allowed_direct = {"title", "description", "questions", "answer_key", "total_marks",
                           "difficulty_level", "time_limit", "is_published", "class_id"}
         # Fields that live inside the `configuration` JSONB column
-        meta_fields = {"template", "institution_name", "teacher_name", "course_name", "exam_date",
-                       "duration", "instructions", "student_fields"}
+        meta_fields = {"template", "institution_name", "faculty_name", "department_name",
+                   "program_name", "session_name", "logo_left_url", "logo_right_url",
+                   "teacher_name", "course_name", "course_code", "exam_date",
+                   "duration", "instructions", "student_fields"}
 
         update_data: dict = {k: v for k, v in payload.items() if k in allowed_direct}
 
@@ -1509,10 +1570,17 @@ def _serialize_paper(paper: dict) -> dict:
         "total_marks": paper.get("total_marks") or 0,
         "is_published": paper.get("is_published", False),
         "difficulty_level": cfg.get("difficulty_level", "medium"),
-        "template": cfg.get("template", "classic"),
+        "template": _normalize_template_key(cfg.get("template")),
         "institution_name": cfg.get("institution_name"),
+        "faculty_name": cfg.get("faculty_name"),
+        "department_name": cfg.get("department_name"),
+        "program_name": cfg.get("program_name"),
+        "session_name": cfg.get("session_name"),
+        "logo_left_url": cfg.get("logo_left_url"),
+        "logo_right_url": cfg.get("logo_right_url"),
         "teacher_name": cfg.get("teacher_name") or (cfg.get("teacher_profile") or {}).get("teacher_name"),
         "course_name": cfg.get("course_name"),
+        "course_code": cfg.get("course_code"),
         "exam_date": cfg.get("exam_date"),
         "duration": cfg.get("duration"),
         "instructions": cfg.get("instructions"),
@@ -1557,10 +1625,10 @@ def _build_paper_pdf(
 ) -> bytes:
     """Build a PDF for the paper using the specified template. Returns raw bytes."""
     from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch, cm
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT, TA_JUSTIFY
+    from reportlab.lib.enums import TA_CENTER
     from reportlab.lib import colors
     import io
 
@@ -1577,32 +1645,163 @@ def _build_paper_pdf(
     custom_instructions = meta.get("instructions") or ""
     student_fields = meta.get("student_fields") or ["name", "roll_number"]
 
-    # Shared question section builder
-    def _add_questions(story, section_qs, section_title, blank_space, q_style, opt_style, start_num):
-        if not section_qs:
-            return start_num
-        story.append(Paragraph(section_title, styles["_Section"]))
-        story.append(Spacer(1, 8))
-        n = start_num
-        for q in section_qs:
-            marks = q.get("marks") or q.get("max_score") or 5
-            q_text = f"{n}. {q.get('question_text', '')} <font size='9' color='grey'>({marks} marks)</font>"
-            story.append(Paragraph(q_text, q_style))
-            if q.get("question_type") == "mcq" and q.get("options"):
-                for j, opt in enumerate(q["options"]):
-                    clean = opt.strip()
-                    for prefix in ("A)", "B)", "C)", "D)", "a)", "b)", "c)", "d)"):
-                        if clean.startswith(prefix):
-                            clean = clean[2:].strip()
-                    story.append(Paragraph(f"{chr(65+j)}) {clean}", opt_style))
+    template = _normalize_template_key(template)
+    base_font = "Times-Roman"
+    bold_font = "Times-Bold"
+    faculty_name = meta.get("faculty_name") or ""
+    department_name = meta.get("department_name") or ""
+    program_name = meta.get("program_name") or ""
+    session_name = meta.get("session_name") or ""
+    course_code = meta.get("course_code") or ""
+    logo_left_url = meta.get("logo_left_url") or ""
+    logo_right_url = meta.get("logo_right_url") or ""
+    note_text = custom_instructions or "Attempt all questions."
+
+    def _line_value(value, length=24):
+        if value is None:
+            return "_" * length
+        if isinstance(value, (int, float)):
+            if value == 0:
+                return "_" * length
+            return str(value)
+        if isinstance(value, str) and value.strip():
+            return value
+        return "_" * length
+
+    def _load_logo(url: str):
+        if not url:
+            return None
+        try:
+            import os
+            import urllib.request
+
+            if url.startswith("http://") or url.startswith("https://"):
+                with urllib.request.urlopen(url, timeout=4) as resp:
+                    data = resp.read()
+                img = Image(io.BytesIO(data))
             else:
-                story.append(Spacer(1, blank_space))
-            story.append(Spacer(1, 6))
+                if not os.path.exists(url):
+                    return None
+                img = Image(url)
+            img.drawHeight = 1.0 * inch
+            img.drawWidth = 1.0 * inch
+            img.hAlign = "CENTER"
+            return img
+        except Exception:
+            return None
+
+    def _clean_option(opt: str) -> str:
+        clean = opt.strip()
+        for prefix in ("A)", "B)", "C)", "D)", "a)", "b)", "c)", "d)"):
+            if clean.startswith(prefix):
+                clean = clean[2:].strip()
+        return clean
+
+    def _format_question_text(q: dict, extra_lines: int) -> str:
+        text = (q.get("question_text") or "").strip()
+        if not text:
+            text = "_" * 35
+        if q.get("question_type") == "mcq" and q.get("options"):
+            options = [f"{chr(65 + i)}) {_clean_option(opt)}" for i, opt in enumerate(q["options"]) if opt]
+            if options:
+                text += "<br/>" + "<br/>".join(options)
+        if extra_lines > 0:
+            text += "<br/>" * extra_lines
+        return text
+
+    def _add_section(story, section_title, section_questions, start_num, extra_lines):
+        if not section_questions:
+            return start_num
+        story.append(Paragraph(section_title, ParagraphStyle(
+            "Section", parent=styles["Normal"], fontName=bold_font,
+            fontSize=12, alignment=TA_CENTER, spaceBefore=10, spaceAfter=6)))
+        rows = [["Q No.", "Questions", "Marks", "CLOs"]]
+        n = start_num
+        q_style = ParagraphStyle("QStyle", parent=styles["Normal"], fontName=base_font, fontSize=9, leading=12)
+        for q in section_questions:
+            marks = q.get("marks") or q.get("max_score") or 5
+            q_text = _format_question_text(q, extra_lines)
+            rows.append([
+                str(n),
+                Paragraph(q_text, q_style),
+                str(marks),
+                "_" * 6,
+            ])
             n += 1
+        table = Table(
+            rows,
+            colWidths=[0.6 * inch, doc.width - (2.0 * inch), 0.7 * inch, 0.7 * inch],
+            repeatRows=1,
+        )
+        table.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f5f5f5")),
+            ("FONTNAME", (0, 0), (-1, 0), bold_font),
+            ("FONTSIZE", (0, 0), (-1, 0), 9),
+            ("FONTSIZE", (0, 1), (-1, -1), 9),
+            ("ALIGN", (0, 0), (0, -1), "CENTER"),
+            ("ALIGN", (2, 1), (2, -1), "CENTER"),
+            ("ALIGN", (3, 1), (3, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(table)
+        story.append(Spacer(1, 12))
         return n
 
-    # ── Student detail box ──────────────────────────────────────────────────
-    FIELD_LABELS = {
+    margin = 0.8 * inch
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=margin,
+        leftMargin=margin,
+        topMargin=margin,
+        bottomMargin=margin,
+    )
+    story = []
+
+    header_title = ParagraphStyle("HdrTitle", parent=styles["Normal"], fontName=bold_font, fontSize=18, alignment=TA_CENTER, leading=20)
+    header_sub = ParagraphStyle("HdrSub", parent=styles["Normal"], fontName=bold_font, fontSize=14, alignment=TA_CENTER, leading=16)
+    logo_style = ParagraphStyle("Logo", parent=styles["Normal"], fontName=base_font, fontSize=8, alignment=TA_CENTER)
+
+    logo_left = _load_logo(logo_left_url)
+    logo_right = _load_logo(logo_right_url)
+    left_cell = logo_left or Paragraph("LOGO", logo_style)
+    right_cell = logo_right or Paragraph("LOGO", logo_style)
+
+    center_rows = [
+        [Paragraph(institution.upper(), header_title)],
+        [Paragraph(faculty_name or "Faculty Name", header_sub)],
+        [Paragraph(department_name or "Department Name", header_sub)],
+    ]
+    center_table = Table(center_rows, colWidths=[doc.width - (2.0 * inch)])
+    center_table.setStyle(TableStyle([
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+
+    header_table = Table(
+        [[left_cell, center_table, right_cell]],
+        colWidths=[1.0 * inch, doc.width - (2.0 * inch), 1.0 * inch],
+        rowHeights=[1.0 * inch],
+    )
+    header_table.setStyle(TableStyle([
+        ("BOX", (0, 0), (0, 0), 0.8, colors.black),
+        ("BOX", (2, 0), (2, 0), 0.8, colors.black),
+        ("ALIGN", (0, 0), (0, 0), "CENTER"),
+        ("ALIGN", (2, 0), (2, 0), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+
+    story.append(header_table)
+    story.append(Spacer(1, 12))
+
+    info_style = ParagraphStyle("Info", parent=styles["Normal"], fontName=base_font, fontSize=9, leading=12)
+
+    field_labels = {
         "name": "Student Name",
         "roll_number": "Roll No.",
         "class": "Class",
@@ -1612,216 +1811,91 @@ def _build_paper_pdf(
     }
 
     def _student_box(story, fields):
-        rows = [
-            [FIELD_LABELS.get(f, f.replace("_", " ").title()) + ":", "________________________"]
-            for f in fields
-        ]
-        if not rows:
+        if not fields:
             return
-        t = Table(rows, colWidths=[1.6 * inch, 3.2 * inch])
-        t.setStyle(TableStyle([
-            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        rows = []
+        for f in fields:
+            label = field_labels.get(f, f.replace("_", " ").title())
+            rows.append([
+                Paragraph(f"<b>{label}:</b>", info_style),
+                Paragraph("_" * 32, info_style),
+            ])
+        table = Table(rows, colWidths=[1.6 * inch, doc.width - (1.6 * inch)])
+        table.setStyle(TableStyle([
             ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-        ]))
-        story.append(t)
-        story.append(Spacer(1, 12))
-
-    # ── Template dispatchers ─────────────────────────────────────────────────
-
-    if template == "university":
-        doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=50, leftMargin=50,
-                                topMargin=45, bottomMargin=45)
-        story = []
-        # Top border rule
-        story.append(HRFlowable(width="100%", thickness=2.5, color=colors.HexColor("#1a237e")))
-        story.append(Spacer(1, 6))
-        # Two-column header: logo placeholder | institution
-        hdr = Table(
-            [["[LOGO]", institution.upper()]],
-            colWidths=[1.2 * inch, 5.3 * inch],
-        )
-        hdr.setStyle(TableStyle([
-            ("FONTNAME", (0, 0), (0, 0), "Helvetica"),
-            ("FONTSIZE", (0, 0), (0, 0), 9),
-            ("FONTNAME", (1, 0), (1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (1, 0), (1, 0), 17),
-            ("ALIGN", (1, 0), (1, 0), "CENTER"),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TEXTCOLOR", (1, 0), (1, 0), colors.HexColor("#1a237e")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
         ]))
-        story.append(hdr)
-        story.append(Spacer(1, 4))
-        story.append(Paragraph("Examination Department", ParagraphStyle(
-            "SubHdr", parent=styles["Normal"], fontSize=10, alignment=TA_CENTER,
-            textColor=colors.HexColor("#3949AB"))))
-        story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#1a237e")))
+        story.append(table)
         story.append(Spacer(1, 10))
-        # Info table
-        info = Table([
-            [f"Course: {course}", f"Date: {exam_date}"],
-            [f"Subject: {subject_name}", f"Duration: {duration}"],
-            [f"Total Marks: {total_marks}", f"Teacher: {teacher_name}"],
-        ], colWidths=[3.5 * inch, 3 * inch])
-        info.setStyle(TableStyle([
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ]))
-        story.append(info)
-        story.append(Spacer(1, 8))
-        story.append(Paragraph(title, ParagraphStyle(
-            "PTitle", parent=styles["Heading2"], fontSize=13, alignment=TA_CENTER)))
-        story.append(Spacer(1, 6))
-        _student_box(story, student_fields)
-        if custom_instructions:
-            story.append(Paragraph("<b>Instructions:</b> " + custom_instructions,
-                                   ParagraphStyle("Ins", parent=styles["Normal"], fontSize=9)))
-            story.append(Spacer(1, 8))
-        styles.add(ParagraphStyle("_Section", parent=styles["Heading3"], fontSize=11,
-                                   spaceBefore=12, spaceAfter=6,
-                                   textColor=colors.HexColor("#1a237e"), fontName="Helvetica-Bold"))
-        q_style = ParagraphStyle("QStyle", parent=styles["Normal"], fontSize=10, spaceAfter=4)
-        opt_style = ParagraphStyle("OptStyle", parent=styles["Normal"], fontSize=9, leftIndent=22, spaceAfter=3)
 
-    elif template == "school":
-        doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=45, leftMargin=45,
-                                topMargin=45, bottomMargin=45)
-        story = []
-        # Colorful header band
-        band = Table([[institution.upper()]], colWidths=[6.7 * inch])
-        band.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FF6F00")),
-            ("TEXTCOLOR", (0, 0), (-1, -1), colors.white),
-            ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 16),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("TOPPADDING", (0, 0), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-        ]))
-        story.append(band)
-        story.append(Spacer(1, 8))
-        story.append(Paragraph(title, ParagraphStyle(
-            "SchTitle", parent=styles["Normal"], fontSize=14,
-            fontName="Helvetica-Bold", alignment=TA_CENTER)))
-        story.append(Spacer(1, 6))
-        info = Table([
-            [f"Subject: {subject_name or course}", f"Class: {class_name}", f"Total Marks: {total_marks}"],
-            [f"Date: {exam_date}", f"Duration: {duration}", f"Teacher: {teacher_name}"],
-        ], colWidths=[2.2 * inch, 2.2 * inch, 2.3 * inch])
-        info.setStyle(TableStyle([
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#FF6F00")),
-            ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#FFB74D")),
-        ]))
-        story.append(info)
-        story.append(Spacer(1, 10))
-        _student_box(story, student_fields)
-        if custom_instructions:
-            story.append(Paragraph(f"<b>Instructions:</b> {custom_instructions}",
-                                   ParagraphStyle("Ins", parent=styles["Normal"], fontSize=9)))
-            story.append(Spacer(1, 8))
-        styles.add(ParagraphStyle("_Section", parent=styles["Normal"], fontSize=11,
-                                   fontName="Helvetica-Bold", spaceBefore=14, spaceAfter=6,
-                                   textColor=colors.HexColor("#E65100"), backColor=colors.HexColor("#FFF3E0")))
-        q_style = ParagraphStyle("QStyle", parent=styles["Normal"], fontSize=10, spaceAfter=5, leading=14)
-        opt_style = ParagraphStyle("OptStyle", parent=styles["Normal"], fontSize=9, leftIndent=22, spaceAfter=3)
+    session_value = session_name or exam_date
+    info_rows = [
+        [
+            Paragraph(f"<b>Program:</b> {_line_value(program_name)}", info_style),
+            Paragraph(f"<b>Time Allowed:</b> {_line_value(duration, 12)}", info_style),
+        ],
+        [
+            Paragraph(f"<b>Session:</b> {_line_value(session_value)}", info_style),
+            Paragraph(f"<b>Total Marks:</b> {_line_value(total_marks if total_marks else '', 12)}", info_style),
+        ],
+        [
+            Paragraph(f"<b>Examination:</b> {_line_value(title, 18)}", info_style),
+            Paragraph(f"<b>Instructor:</b> {_line_value(teacher_name, 18)}", info_style),
+        ],
+        [
+            Paragraph(f"<b>Course Title:</b> {_line_value(course or subject_name, 18)}", info_style),
+            Paragraph(f"<b>Course Code:</b> {_line_value(course_code, 12)}", info_style),
+        ],
+        [Paragraph(f"<b>Note:</b> {note_text}", info_style), ""],
+    ]
 
-    elif template == "minimalist":
-        doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=60, leftMargin=60,
-                                topMargin=55, bottomMargin=55)
-        story = []
-        story.append(Paragraph(institution, ParagraphStyle(
-            "MIns", parent=styles["Normal"], fontSize=10,
-            textColor=colors.grey, alignment=TA_LEFT)))
-        story.append(Spacer(1, 4))
-        story.append(Paragraph(title, ParagraphStyle(
-            "MTitle", parent=styles["Normal"], fontSize=16,
-            fontName="Helvetica-Bold", spaceAfter=4)))
-        story.append(HRFlowable(width="100%", thickness=0.5, color=colors.grey))
-        story.append(Spacer(1, 6))
-        info = Table([
-            [f"{subject_name or course}", f"{exam_date}", f"{total_marks} marks", f"{duration}"]
-        ], colWidths=[1.8 * inch, 1.6 * inch, 1.5 * inch, 1.5 * inch])
-        info.setStyle(TableStyle([
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("TEXTCOLOR", (0, 0), (-1, -1), colors.grey),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-        ]))
-        story.append(info)
-        story.append(Spacer(1, 10))
-        _student_box(story, student_fields)
-        if custom_instructions:
-            story.append(Paragraph(custom_instructions,
-                                   ParagraphStyle("Ins", parent=styles["Normal"], fontSize=8,
-                                                  textColor=colors.grey)))
-            story.append(Spacer(1, 8))
-        styles.add(ParagraphStyle("_Section", parent=styles["Normal"], fontSize=10,
-                                   fontName="Helvetica-Bold", spaceBefore=12, spaceAfter=5,
-                                   textColor=colors.black))
-        q_style = ParagraphStyle("QStyle", parent=styles["Normal"], fontSize=10, spaceAfter=4, leading=13)
-        opt_style = ParagraphStyle("OptStyle", parent=styles["Normal"], fontSize=9, leftIndent=18, spaceAfter=2)
+    info_table = Table(info_rows, colWidths=[9.5 * cm, 6.5 * cm])
+    info_table.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
+        ("INNERGRID", (0, 0), (-1, -2), 0.5, colors.black),
+        ("SPAN", (0, -1), (1, -1)),
+        ("LINEABOVE", (0, -1), (-1, -1), 0.5, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
 
-    else:  # classic (default)
-        doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=50, leftMargin=50,
-                                topMargin=50, bottomMargin=50)
-        story = []
-        story.append(Paragraph(institution.upper(), ParagraphStyle(
-            "CIns", parent=styles["Heading1"], fontSize=16, spaceAfter=4, alignment=TA_CENTER)))
-        story.append(Paragraph("EXAMINATION DEPARTMENT", ParagraphStyle(
-            "CDept", parent=styles["Normal"], fontSize=10, alignment=TA_CENTER,
-            textColor=colors.grey)))
-        story.append(Spacer(1, 16))
-        paper_info = [
-            ["Subject:", subject_name or course],
-            ["Class:", class_name],
-            ["Teacher:", teacher_name],
-            ["Total Marks:", str(total_marks)],
-            ["Time:", duration],
-            ["Date:", exam_date],
-        ]
-        it = Table(paper_info, colWidths=[1.5 * inch, 3 * inch])
-        it.setStyle(TableStyle([
-            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 10),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ]))
-        story.append(it)
-        story.append(Spacer(1, 16))
-        story.append(Paragraph(title, ParagraphStyle(
-            "PTitle", parent=styles["Heading2"], fontSize=14, alignment=TA_CENTER)))
-        story.append(Spacer(1, 10))
-        _student_box(story, student_fields)
-        instr_lines = (custom_instructions or "Answer ALL questions. Marks are indicated against each question.").split("\n")
-        story.append(Paragraph("<b>Instructions:</b>", ParagraphStyle(
-            "InsHdr", parent=styles["Normal"], fontSize=10)))
-        for line in instr_lines:
-            if line.strip():
-                story.append(Paragraph(line.strip(), styles["Normal"]))
-        story.append(Spacer(1, 16))
-        styles.add(ParagraphStyle("_Section", parent=styles["Heading3"], fontSize=12,
-                                   spaceBefore=14, spaceAfter=8, textColor=colors.black))
-        q_style = ParagraphStyle("QStyle", parent=styles["Normal"], fontSize=11, spaceAfter=8)
-        opt_style = ParagraphStyle("OptStyle", parent=styles["Normal"], fontSize=10, leftIndent=25, spaceAfter=4)
+    story.append(info_table)
+    story.append(Spacer(1, 8))
+    _student_box(story, student_fields)
+    story.append(Spacer(1, 8))
 
-    # ── Common question sections ────────────────────────────────────────────
-    mcq_qs = [q for q in questions if q.get("question_type") == "mcq"]
-    short_qs = [q for q in questions if q.get("question_type") == "short_answer"]
-    long_qs = [q for q in questions if q.get("question_type") in ("essay", "long_answer")]
-    tf_qs = [q for q in questions if q.get("question_type") == "true_false"]
-    fill_qs = [q for q in questions if q.get("question_type") in ("fill_blank", "fill_in_blank")]
-    other_qs = [q for q in questions if q.get("question_type") not in
-                ("mcq", "short_answer", "essay", "long_answer", "true_false", "fill_blank", "fill_in_blank")]
+    short_questions = [q for q in questions if q.get("question_type") not in ("essay", "long_answer")]
+    long_questions = [q for q in questions if q.get("question_type") in ("essay", "long_answer")]
 
     n = 1
-    n = _add_questions(story, mcq_qs, "SECTION A: MULTIPLE CHOICE QUESTIONS", 0, q_style, opt_style, n)
-    n = _add_questions(story, short_qs, "SECTION B: SHORT ANSWER QUESTIONS", 38, q_style, opt_style, n)
-    n = _add_questions(story, long_qs, "SECTION C: LONG ANSWER / ESSAY QUESTIONS", 65, q_style, opt_style, n)
-    n = _add_questions(story, tf_qs, "SECTION D: TRUE / FALSE", 20, q_style, opt_style, n)
-    n = _add_questions(story, fill_qs, "SECTION E: FILL IN THE BLANKS", 28, q_style, opt_style, n)
-    n = _add_questions(story, other_qs, "SECTION F: OTHER QUESTIONS", 38, q_style, opt_style, n)
+    n = _add_section(story, "SECTION -- A : SHORT QUESTIONS", short_questions, n, 2)
+    n = _add_section(story, "SECTION -- B : LONG QUESTIONS", long_questions, n, 6)
+
+    sig_style = ParagraphStyle("Sig", parent=styles["Normal"], fontName=bold_font, fontSize=10)
+    sig_table = Table(
+        [[
+            Paragraph("<b>Instructor Signature:</b> ____________________", sig_style),
+            Paragraph("<b>HOD Signature:</b> ____________________", sig_style),
+        ]],
+        colWidths=[doc.width / 2, doc.width / 2],
+    )
+    sig_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    story.append(Spacer(1, 6))
+    story.append(sig_table)
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("--- Best of Luck ---", ParagraphStyle(
+        "BestLuck", parent=styles["Normal"], fontName=bold_font, fontSize=10, alignment=TA_CENTER)))
 
     doc.build(story)
     pdf_bytes = buffer.getvalue()
