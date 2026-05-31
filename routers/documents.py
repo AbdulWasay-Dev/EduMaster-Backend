@@ -54,10 +54,11 @@ class DocumentListResponse(BaseModel):
 
 
 def _doc_to_response(doc: dict) -> DocumentResponse:
+    display_filename = doc.get("original_filename") or doc.get("filename") or "Untitled document"
     return DocumentResponse(
         id=str(doc["id"]),
-        filename=doc["filename"],
-        original_filename=doc["original_filename"],
+        filename=display_filename,
+        original_filename=doc.get("original_filename") or display_filename,
         file_type=doc["file_type"],
         file_size=doc.get("file_size") or 0,
         page_count=doc.get("page_count"),

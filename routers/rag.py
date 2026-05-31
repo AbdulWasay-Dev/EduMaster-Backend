@@ -147,20 +147,57 @@ async def query_rag(
                 detail="Failed to generate answer"
             )
         
-        # Prepare sources if requested
+        # Prepare sources if requested. Use document names from the DB, not storage IDs.
         rag_sources: List[RAGSource] = []
         if request.include_sources:
-            raw_sources = answer_result.get("sources", [])
-            for src in raw_sources:
-                if isinstance(src, dict):
-                    rag_sources.append(RAGSource(
-                        document_id=str(src.get("document_id", "")),
-                        document_name=src.get("document_name", ""),
-                        chunk_text=src.get("chunk_text", src.get("text", "")),
-                        relevance_score=float(src.get("relevance_score", src.get("similarity", 0.0))),
-                    ))
-                elif isinstance(src, str):
-                    rag_sources.append(RAGSource(chunk_text=src))
+            document_names: Dict[str, str] = {}
+            seen_sources = set()
+            max_sources = min(request.top_k or 5, 5)
+
+            for chunk in similar_chunks:
+                document_id = str(chunk.get("document_id") or "")
+                if document_id and document_id not in document_names:
+                    document = await db.get_document(document_id)
+                    document_names[document_id] = (
+                        (document or {}).get("original_filename")
+                        or (document or {}).get("title")
+                        or (document or {}).get("filename")
+                        or ""
+                    )
+
+                source_key = (
+                    document_id,
+                    str(chunk.get("id") or chunk.get("chunk_index") or chunk.get("text", "")[:80]),
+                )
+                if source_key in seen_sources:
+                    continue
+                seen_sources.add(source_key)
+
+                rag_sources.append(RAGSource(
+                    document_id=document_id,
+                    document_name=document_names.get(document_id, ""),
+                    document_title=document_names.get(document_id, ""),
+                    chunk_text=chunk.get("text") or chunk.get("chunk_text", ""),
+                    relevance_score=float(chunk.get("relevance_score", chunk.get("similarity", 0.0))),
+                    page_number=(chunk.get("metadata") or {}).get("page_number") if isinstance(chunk.get("metadata"), dict) else None,
+                ))
+
+                if len(rag_sources) >= max_sources:
+                    break
+
+            if not rag_sources:
+                raw_sources = answer_result.get("sources", [])
+                for src in raw_sources:
+                    if isinstance(src, dict):
+                        rag_sources.append(RAGSource(
+                            document_id=str(src.get("document_id", "")),
+                            document_name=src.get("document_name", ""),
+                            document_title=src.get("document_title"),
+                            chunk_text=src.get("chunk_text", src.get("text", "")),
+                            relevance_score=float(src.get("relevance_score", src.get("similarity", 0.0))),
+                        ))
+                    elif isinstance(src, str):
+                        rag_sources.append(RAGSource(chunk_text=src))
         
         return RAGQueryResponse(
             answer=answer_result["answer"],

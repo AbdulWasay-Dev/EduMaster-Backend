@@ -428,9 +428,11 @@ async def get_subject_documents(
         return [
             {
                 "id": str(d["id"]),
-                "file_name": d.get("file_name", ""),
+                "file_name": d.get("original_filename") or d.get("filename", ""),
+                "filename": d.get("original_filename") or d.get("filename", ""),
+                "original_filename": d.get("original_filename") or d.get("filename", ""),
                 "file_type": d.get("file_type", ""),
-                "status": d.get("status", ""),
+                "status": d.get("processing_status", d.get("status", "")),
                 "created_at": str(d.get("created_at", "")),
             }
             for d in (docs or [])

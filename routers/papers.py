@@ -44,8 +44,6 @@ class PaperGenerationRequest(BaseModel):
     department_name: Optional[str] = Field(None, description="Department name for the paper header")
     program_name: Optional[str] = Field(None, description="Program name displayed on the paper")
     session_name: Optional[str] = Field(None, description="Session / academic term")
-    logo_left_url: Optional[str] = Field(None, description="Left logo image URL")
-    logo_right_url: Optional[str] = Field(None, description="Right logo image URL")
     teacher_name: Optional[str] = Field(None, description="Teacher name displayed on the paper")
     course_name: Optional[str] = Field(None, description="Course name displayed on the paper")
     course_code: Optional[str] = Field(None, description="Course code displayed on the paper")
@@ -86,8 +84,6 @@ class PaperResponse(BaseModel):
     department_name: Optional[str] = None
     program_name: Optional[str] = None
     session_name: Optional[str] = None
-    logo_left_url: Optional[str] = None
-    logo_right_url: Optional[str] = None
     teacher_name: Optional[str] = None
     course_name: Optional[str] = None
     course_code: Optional[str] = None
@@ -130,8 +126,6 @@ def _teacher_paper_defaults(teacher: Optional[dict], subject_name: str = "") -> 
         "department_name": teacher.get("department") or "",
         "program_name": "",
         "session_name": "",
-        "logo_left_url": "",
-        "logo_right_url": "",
         "teacher_name": teacher.get("name") or "Unknown Teacher",
         "course_name": teacher.get("default_course_name") or subject_name,
         "course_code": "",
@@ -344,8 +338,6 @@ async def generate_paper(
         resolved_department = request.department_name or teacher_defaults["department_name"]
         resolved_program = request.program_name or teacher_defaults["program_name"]
         resolved_session = request.session_name or teacher_defaults["session_name"]
-        resolved_logo_left = request.logo_left_url or teacher_defaults["logo_left_url"]
-        resolved_logo_right = request.logo_right_url or teacher_defaults["logo_right_url"]
         resolved_teacher_name = request.teacher_name or teacher_defaults["teacher_name"]
         resolved_course = request.course_name or teacher_defaults["course_name"]
         resolved_course_code = request.course_code or teacher_defaults["course_code"]
@@ -373,8 +365,6 @@ async def generate_paper(
                 "department_name": resolved_department,
                 "program_name": resolved_program,
                 "session_name": resolved_session,
-                "logo_left_url": resolved_logo_left,
-                "logo_right_url": resolved_logo_right,
                 "teacher_name": resolved_teacher_name,
                 "course_name": resolved_course,
                 "course_code": resolved_course_code,
@@ -567,8 +557,6 @@ async def create_paper_from_question_sheet(
                 "department_name": teacher_defaults["department_name"],
                 "program_name": teacher_defaults["program_name"],
                 "session_name": teacher_defaults["session_name"],
-                "logo_left_url": teacher_defaults["logo_left_url"],
-                "logo_right_url": teacher_defaults["logo_right_url"],
                 "teacher_name": teacher_defaults["teacher_name"],
                 "course_name": teacher_defaults["course_name"],
                 "course_code": teacher_defaults["course_code"],
@@ -749,8 +737,6 @@ async def export_paper(
             "department_name": _cfg.get("department_name") or teacher_defaults["department_name"],
             "program_name": _cfg.get("program_name") or teacher_defaults["program_name"],
             "session_name": _cfg.get("session_name") or teacher_defaults["session_name"],
-            "logo_left_url": _cfg.get("logo_left_url") or teacher_defaults["logo_left_url"],
-            "logo_right_url": _cfg.get("logo_right_url") or teacher_defaults["logo_right_url"],
             "teacher_name": _cfg.get("teacher_name") or teacher_defaults["teacher_name"],
             "course_name": _cfg.get("course_name") or teacher_defaults["course_name"],
             "course_code": _cfg.get("course_code") or teacher_defaults["course_code"],
@@ -1389,9 +1375,11 @@ async def list_subject_documents(
         # Return document info for chapter selection
         document_info = []
         for doc in documents:
+            display_filename = doc.get("original_filename") or doc.get("filename") or "Untitled document"
             document_info.append({
                 "id": doc["id"],
-                "filename": doc["filename"],
+                "filename": display_filename,
+                "original_filename": display_filename,
                 "processing_status": doc.get("processing_status", "unknown"),
                 "created_at": doc.get("created_at"),
                 "file_size": doc.get("file_size")
@@ -1489,9 +1477,9 @@ async def update_paper_endpoint(
                           "difficulty_level", "time_limit", "is_published", "class_id"}
         # Fields that live inside the `configuration` JSONB column
         meta_fields = {"template", "institution_name", "faculty_name", "department_name",
-                   "program_name", "session_name", "logo_left_url", "logo_right_url",
-                   "teacher_name", "course_name", "course_code", "exam_date",
-                   "duration", "instructions", "student_fields"}
+                   "program_name", "session_name", "teacher_name", "course_name",
+                   "course_code", "exam_date", "duration", "instructions",
+                   "student_fields"}
 
         update_data: dict = {k: v for k, v in payload.items() if k in allowed_direct}
 
@@ -1576,8 +1564,6 @@ def _serialize_paper(paper: dict) -> dict:
         "department_name": cfg.get("department_name"),
         "program_name": cfg.get("program_name"),
         "session_name": cfg.get("session_name"),
-        "logo_left_url": cfg.get("logo_left_url"),
-        "logo_right_url": cfg.get("logo_right_url"),
         "teacher_name": cfg.get("teacher_name") or (cfg.get("teacher_profile") or {}).get("teacher_name"),
         "course_name": cfg.get("course_name"),
         "course_code": cfg.get("course_code"),
@@ -1625,7 +1611,7 @@ def _build_paper_pdf(
 ) -> bytes:
     """Build a PDF for the paper using the specified template. Returns raw bytes."""
     from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch, cm
     from reportlab.lib.enums import TA_CENTER
@@ -1653,8 +1639,6 @@ def _build_paper_pdf(
     program_name = meta.get("program_name") or ""
     session_name = meta.get("session_name") or ""
     course_code = meta.get("course_code") or ""
-    logo_left_url = meta.get("logo_left_url") or ""
-    logo_right_url = meta.get("logo_right_url") or ""
     note_text = custom_instructions or "Attempt all questions."
 
     def _line_value(value, length=24):
@@ -1668,27 +1652,6 @@ def _build_paper_pdf(
             return value
         return "_" * length
 
-    def _load_logo(url: str):
-        if not url:
-            return None
-        try:
-            import os
-            import urllib.request
-
-            if url.startswith("http://") or url.startswith("https://"):
-                with urllib.request.urlopen(url, timeout=4) as resp:
-                    data = resp.read()
-                img = Image(io.BytesIO(data))
-            else:
-                if not os.path.exists(url):
-                    return None
-                img = Image(url)
-            img.drawHeight = 1.0 * inch
-            img.drawWidth = 1.0 * inch
-            img.hAlign = "CENTER"
-            return img
-        except Exception:
-            return None
 
     def _clean_option(opt: str) -> str:
         clean = opt.strip()
@@ -1765,38 +1728,9 @@ def _build_paper_pdf(
 
     header_title = ParagraphStyle("HdrTitle", parent=styles["Normal"], fontName=bold_font, fontSize=18, alignment=TA_CENTER, leading=20)
     header_sub = ParagraphStyle("HdrSub", parent=styles["Normal"], fontName=bold_font, fontSize=14, alignment=TA_CENTER, leading=16)
-    logo_style = ParagraphStyle("Logo", parent=styles["Normal"], fontName=base_font, fontSize=8, alignment=TA_CENTER)
-
-    logo_left = _load_logo(logo_left_url)
-    logo_right = _load_logo(logo_right_url)
-    left_cell = logo_left or Paragraph("LOGO", logo_style)
-    right_cell = logo_right or Paragraph("LOGO", logo_style)
-
-    center_rows = [
-        [Paragraph(institution.upper(), header_title)],
-        [Paragraph(faculty_name or "Faculty Name", header_sub)],
-        [Paragraph(department_name or "Department Name", header_sub)],
-    ]
-    center_table = Table(center_rows, colWidths=[doc.width - (2.0 * inch)])
-    center_table.setStyle(TableStyle([
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
-
-    header_table = Table(
-        [[left_cell, center_table, right_cell]],
-        colWidths=[1.0 * inch, doc.width - (2.0 * inch), 1.0 * inch],
-        rowHeights=[1.0 * inch],
-    )
-    header_table.setStyle(TableStyle([
-        ("BOX", (0, 0), (0, 0), 0.8, colors.black),
-        ("BOX", (2, 0), (2, 0), 0.8, colors.black),
-        ("ALIGN", (0, 0), (0, 0), "CENTER"),
-        ("ALIGN", (2, 0), (2, 0), "CENTER"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
-
-    story.append(header_table)
+    story.append(Paragraph(institution.upper(), header_title))
+    story.append(Paragraph(faculty_name or "Faculty Name", header_sub))
+    story.append(Paragraph(department_name or "Department Name", header_sub))
     story.append(Spacer(1, 12))
 
     info_style = ParagraphStyle("Info", parent=styles["Normal"], fontName=base_font, fontSize=9, leading=12)
