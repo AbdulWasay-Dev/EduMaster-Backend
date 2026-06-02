@@ -4,7 +4,7 @@ Assignments API — CRUD + publish/close + AI generation + submissions + grading
 NOTE: Static routes (email/*, generate-content) MUST come before /{assignment_id}
 """
 import logging, os, uuid, json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
@@ -65,7 +65,9 @@ def _ser(a: dict) -> dict:
         "id": str(a["id"]),
         "teacher_id": str(a["teacher_id"]),
         "subject_id": str(a["subject_id"]),
+        "subject_name": a.get("subject_name"),
         "class_id": str(a["class_id"]),
+        "class_name": a.get("class_name"),
         "title": a.get("title", ""),
         "description": a.get("description"),
         "instructions": a.get("instructions"),
@@ -92,11 +94,16 @@ def _ser_sub(s: dict) -> dict:
     return {
         "id": str(s["id"]),
         "assignment_id": str(s["assignment_id"]),
+        "assignment_title": s.get("assignment_title"),
+        "assignment_due_date": str(s["assignment_due_date"]) if s.get("assignment_due_date") else None,
         "student_account_id": str(s["student_account_id"]),
         "student_name": s.get("student_name", ""),
         "student_email": s.get("student_email", ""),
         "roll_number": s.get("roll_number"),
         "class_id": str(s["class_id"]),
+        "class_name": s.get("class_name"),
+        "subject_id": str(s["subject_id"]) if s.get("subject_id") else None,
+        "subject_name": s.get("subject_name"),
         "submission_text": s.get("submission_text"),
         "submission_files": files,
         "marks_obtained": float(s["marks_obtained"]) if s.get("marks_obtained") is not None else None,
@@ -114,6 +121,29 @@ def _ser_sub(s: dict) -> dict:
         "source": s.get("source", "direct"),
     }
 
+def _ser_email_log(log: dict) -> dict:
+    attachments = log.get("attachment_paths", [])
+    if isinstance(attachments, str):
+        try:
+            attachments = json.loads(attachments)
+        except Exception:
+            attachments = []
+    return {
+        "id": str(log["id"]),
+        "assignment_id": str(log["assignment_id"]) if log.get("assignment_id") else None,
+        "assignment_title": log.get("assignment_title"),
+        "student_account_id": str(log["student_account_id"]) if log.get("student_account_id") else None,
+        "student_name": log.get("student_name"),
+        "student_email": log.get("student_email"),
+        "email_from": log.get("email_from"),
+        "email_subject": log.get("email_subject"),
+        "email_body": log.get("email_body"),
+        "attachment_paths": attachments,
+        "processed_at": str(log["processed_at"]) if log.get("processed_at") else None,
+        "status": log.get("status", "processed"),
+        "notes": log.get("notes"),
+    }
+
 def _parse_due(v):
     if not v:
         return None
@@ -121,6 +151,21 @@ def _parse_due(v):
         return datetime.fromisoformat(v.replace("Z", "+00:00"))
     except Exception:
         return None
+
+async def _validate_assignment_scope(db, user, class_id: str, subject_id: str):
+    cls = await db.get_class(class_id)
+    if not cls or str(cls.get("teacher_id")) != user["id"]:
+        raise HTTPException(403, "Access denied to this class")
+
+    subject = await db.get_subject(subject_id)
+    if not subject or str(subject.get("teacher_id")) != user["id"]:
+        raise HTTPException(403, "Access denied to this subject")
+
+    subject_class_id = str(subject.get("class_id")) if subject.get("class_id") else None
+    if subject_class_id and subject_class_id != class_id:
+        raise HTTPException(400, "Selected subject does not belong to the selected class")
+
+    return cls, subject
 
 async def _own(db, user, aid):
     a = await db.get_assignment(aid)
@@ -264,6 +309,7 @@ async def test_email_connection(data: EmailConfigRequest, current_user: dict = D
 @router.post("/")
 async def create_assignment(data: AssignmentCreate, current_user: dict = Depends(require_teacher())):
     db = await get_database()
+    await _validate_assignment_scope(db, current_user, data.class_id, data.subject_id)
     payload = {
         "teacher_id": current_user["id"],
         "subject_id": data.subject_id,
@@ -302,8 +348,11 @@ async def get_assignment(assignment_id: str, current_user: dict = Depends(requir
 @router.patch("/{assignment_id}")
 async def update_assignment(assignment_id: str, data: AssignmentUpdate, current_user: dict = Depends(require_teacher())):
     db = await get_database()
-    await _own(db, current_user, assignment_id)
+    existing = await _own(db, current_user, assignment_id)
     upd = {k: v for k, v in data.dict().items() if v is not None}
+    next_class_id = upd.get("class_id") or str(existing["class_id"])
+    next_subject_id = upd.get("subject_id") or str(existing["subject_id"])
+    await _validate_assignment_scope(db, current_user, next_class_id, next_subject_id)
     if "due_date" in upd:
         upd["due_date"] = _parse_due(upd["due_date"])
     updated = await db.update_assignment(assignment_id, upd)
@@ -573,13 +622,18 @@ async def fetch_email_submissions(assignment_id: str, current_user: dict = Depen
             "class_id": str(a["class_id"]),
             "submission_text": mail_data["body"],
             "submission_files": mail_data["attachments"],
+            "source": "email",
             "status": "submitted",
             "submitted_at": datetime.utcnow(),
         })
         if sub:
             await db.create_email_submission_log({**log_base, "student_account_id": str(student["id"]), "status": "processed"})
             processed += 1
+        else:
+            await db.create_email_submission_log({**log_base, "student_account_id": str(student["id"]), "status": "failed", "notes": "Could not create or update submission"})
+            skipped += 1
 
+    await db.update_email_last_fetched(current_user["id"])
     return {"emails_found": len(emails), "processed": processed, "skipped": skipped,
             "message": f"Processed {processed} submissions, skipped {skipped} unknown senders"}
 
@@ -587,4 +641,5 @@ async def fetch_email_submissions(assignment_id: str, current_user: dict = Depen
 async def get_email_logs(assignment_id: str, current_user: dict = Depends(require_teacher())):
     db = await get_database()
     await _own(db, current_user, assignment_id)
-    return await db.get_email_submission_logs(current_user["id"], assignment_id)
+    logs = await db.get_email_submission_logs(current_user["id"], assignment_id)
+    return [_ser_email_log(log) for log in logs]

@@ -1,8 +1,9 @@
 """
 Configuration settings for EduMaster Backend
 """
+import json
 import os
-from typing import Optional
+from typing import Any, Optional
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
 
@@ -23,6 +24,7 @@ class Settings(BaseSettings):
         default=["*"],  # Allow all origins in development
         env="CORS_ORIGINS"
     )
+    allowed_hosts: list[str] = Field(default=["*"], env="ALLOWED_HOSTS")
     
     # PostgreSQL Database Configuration
     database_url: str = Field(
@@ -109,6 +111,22 @@ class Settings(BaseSettings):
                 return False
             if normalized in {"debug", "dev", "development", "true", "1", "yes", "on"}:
                 return True
+        return value
+
+    @field_validator("cors_origins", "allowed_file_types", "allowed_hosts", mode="before")
+    @classmethod
+    def parse_list_flag(cls, value: Any):
+        """Accept JSON arrays or comma-separated strings from cloud env vars."""
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            if stripped.startswith("["):
+                try:
+                    return json.loads(stripped)
+                except json.JSONDecodeError:
+                    pass
+            return [item.strip() for item in stripped.split(",") if item.strip()]
         return value
     
     class Config:

@@ -106,6 +106,7 @@ ENV PYTHONUNBUFFERED=1 \
     ENVIRONMENT=production \
     DEBUG=false \
     PORT=8010 \
+    ALLOWED_HOSTS=* \
     # Tesseract is on PATH inside the container — no Windows path needed
     TESSERACT_PATH=/usr/bin/tesseract \
     USE_GOOGLE_VISION=false \

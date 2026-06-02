@@ -9,6 +9,7 @@ import os
 import json
 from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import asyncpg
 from asyncpg import Pool
@@ -264,6 +265,7 @@ class DatabaseService:
         ai_rubric_breakdown JSONB,
         teacher_remarks TEXT,
         teacher_override_marks NUMERIC(5,2),
+        source TEXT DEFAULT 'student_portal',
         status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'submitted', 'grading', 'graded', 'returned')),
         submitted_at TIMESTAMP WITH TIME ZONE,
         graded_at TIMESTAMP WITH TIME ZONE,
@@ -271,6 +273,8 @@ class DatabaseService:
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
         UNIQUE (assignment_id, student_account_id)
     );
+
+    ALTER TABLE assignment_submissions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'student_portal';
 
     CREATE TABLE IF NOT EXISTS student_scores (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -558,11 +562,16 @@ class DatabaseService:
         """Create the target database if it does not already exist."""
         db_url = settings.database_url
         try:
-            base_url, db_name = db_url.rsplit("/", 1)
-            # Strip query params from db_name if any
-            if "?" in db_name:
-                db_name = db_name.split("?")[0]
-            postgres_url = f"{base_url}/postgres"
+            parsed = urlsplit(db_url)
+            if not parsed.scheme or not parsed.netloc:
+                raise ValueError("database URL must include scheme and host")
+            db_name = unquote(parsed.path.lstrip("/"))
+            if not db_name:
+                logger.warning("Database URL has no database name - skipping auto-create.")
+                return
+            postgres_url = urlunsplit(
+                (parsed.scheme, parsed.netloc, "/postgres", parsed.query, parsed.fragment)
+            )
         except ValueError:
             logger.warning("Could not parse database name from URL — skipping auto-create.")
             return
@@ -574,7 +583,8 @@ class DatabaseService:
             )
             if not exists:
                 # CREATE DATABASE cannot run inside a transaction block
-                await conn.execute(f'CREATE DATABASE "{db_name}"')
+                safe_db_name = db_name.replace('"', '""')
+                await conn.execute(f'CREATE DATABASE "{safe_db_name}"')
                 logger.info(f"✨ Created database '{db_name}'")
             else:
                 logger.info(f"👍 Database '{db_name}' already exists")
@@ -1616,7 +1626,13 @@ class DatabaseService:
         try:
             async with self.connection() as conn:
                 row = await conn.fetchrow(
-                    "SELECT * FROM assignments WHERE id = $1",
+                    """
+                    SELECT a.*, c.name AS class_name, s.name AS subject_name
+                    FROM assignments a
+                    LEFT JOIN classes c ON c.id = a.class_id
+                    LEFT JOIN subjects s ON s.id = a.subject_id
+                    WHERE a.id = $1
+                    """,
                     uuid.UUID(assignment_id),
                 )
                 return dict(row) if row else None
@@ -1627,22 +1643,28 @@ class DatabaseService:
     async def get_assignments(self, teacher_id: str, class_id: str = None, subject_id: str = None, status: str = None) -> List[Dict[str, Any]]:
         """Get assignments with optional filters"""
         try:
-            q = "SELECT * FROM assignments WHERE teacher_id = $1"
+            q = """
+                SELECT a.*, c.name AS class_name, s.name AS subject_name
+                FROM assignments a
+                LEFT JOIN classes c ON c.id = a.class_id
+                LEFT JOIN subjects s ON s.id = a.subject_id
+                WHERE a.teacher_id = $1
+            """
             params: list = [uuid.UUID(teacher_id)]
             idx = 2
             if class_id:
-                q += f" AND class_id = ${idx}"
+                q += f" AND a.class_id = ${idx}"
                 params.append(uuid.UUID(class_id))
                 idx += 1
             if subject_id:
-                q += f" AND subject_id = ${idx}"
+                q += f" AND a.subject_id = ${idx}"
                 params.append(uuid.UUID(subject_id))
                 idx += 1
             if status:
-                q += f" AND status = ${idx}"
+                q += f" AND a.status = ${idx}"
                 params.append(status)
                 idx += 1
-            q += " ORDER BY created_at DESC"
+            q += " ORDER BY a.created_at DESC"
             async with self.connection() as conn:
                 rows = await conn.fetch(q, *params)
                 return [dict(row) for row in rows]
@@ -1709,11 +1731,12 @@ class DatabaseService:
                     """
                     INSERT INTO assignment_submissions
                         (id, assignment_id, student_account_id, class_id,
-                         submission_text, submission_files, status, submitted_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                         submission_text, submission_files, source, status, submitted_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                     ON CONFLICT (assignment_id, student_account_id) DO UPDATE SET
                         submission_text = EXCLUDED.submission_text,
                         submission_files = EXCLUDED.submission_files,
+                        source = EXCLUDED.source,
                         status = EXCLUDED.status,
                         submitted_at = EXCLUDED.submitted_at,
                         updated_at = NOW()
@@ -1725,6 +1748,7 @@ class DatabaseService:
                     uuid.UUID(data["class_id"]),
                     data.get("submission_text"),
                     json.dumps(data.get("submission_files", [])),
+                    data.get("source", "student_portal"),
                     data.get("status", "submitted"),
                     data.get("submitted_at"),
                 )
@@ -1738,7 +1762,24 @@ class DatabaseService:
         try:
             async with self.connection() as conn:
                 row = await conn.fetchrow(
-                    "SELECT * FROM assignment_submissions WHERE id = $1",
+                    """
+                    SELECT
+                        s.*,
+                        a.title AS assignment_title,
+                        a.subject_id,
+                        a.due_date AS assignment_due_date,
+                        c.name AS class_name,
+                        subj.name AS subject_name,
+                        sa.full_name AS student_name,
+                        sa.roll_number,
+                        sa.email AS student_email
+                    FROM assignment_submissions s
+                    JOIN assignments a ON a.id = s.assignment_id
+                    LEFT JOIN classes c ON c.id = s.class_id
+                    LEFT JOIN subjects subj ON subj.id = a.subject_id
+                    LEFT JOIN student_accounts sa ON sa.id = s.student_account_id
+                    WHERE s.id = $1
+                    """,
                     uuid.UUID(submission_id),
                 )
                 return dict(row) if row else None
@@ -1766,8 +1807,20 @@ class DatabaseService:
             async with self.connection() as conn:
                 rows = await conn.fetch(
                     """
-                    SELECT s.*, sa.full_name as student_name, sa.roll_number, sa.email as student_email
+                    SELECT
+                        s.*,
+                        a.title AS assignment_title,
+                        a.subject_id,
+                        a.due_date AS assignment_due_date,
+                        c.name AS class_name,
+                        subj.name AS subject_name,
+                        sa.full_name AS student_name,
+                        sa.roll_number,
+                        sa.email AS student_email
                     FROM assignment_submissions s
+                    JOIN assignments a ON a.id = s.assignment_id
+                    LEFT JOIN classes c ON c.id = s.class_id
+                    LEFT JOIN subjects subj ON subj.id = a.subject_id
                     JOIN student_accounts sa ON sa.id = s.student_account_id
                     WHERE s.assignment_id = $1
                     ORDER BY s.submitted_at DESC NULLS LAST
@@ -2490,6 +2543,19 @@ class DatabaseService:
             logger.error(f"Error getting email config for teacher {teacher_id}: {e}")
             return None
 
+    async def update_email_last_fetched(self, teacher_id: str) -> bool:
+        """Record the latest successful email sync time for a teacher."""
+        try:
+            async with self.connection() as conn:
+                await conn.execute(
+                    "UPDATE email_integrations SET last_fetched_at = NOW(), updated_at = NOW() WHERE teacher_id = $1",
+                    uuid.UUID(teacher_id),
+                )
+                return True
+        except Exception as e:
+            logger.error(f"Error updating email last_fetched_at for teacher {teacher_id}: {e}")
+            return False
+
     async def create_email_submission_log(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Log a processed email submission"""
         try:
@@ -2523,12 +2589,22 @@ class DatabaseService:
     async def get_email_submission_logs(self, teacher_id: str, assignment_id: str = None) -> List[Dict[str, Any]]:
         """Get email submission logs for a teacher"""
         try:
-            q = "SELECT * FROM email_submission_logs WHERE teacher_id = $1"
+            q = """
+                SELECT
+                    l.*,
+                    a.title AS assignment_title,
+                    sa.full_name AS student_name,
+                    sa.email AS student_email
+                FROM email_submission_logs l
+                LEFT JOIN assignments a ON a.id = l.assignment_id
+                LEFT JOIN student_accounts sa ON sa.id = l.student_account_id
+                WHERE l.teacher_id = $1
+            """
             params: list = [uuid.UUID(teacher_id)]
             if assignment_id:
-                q += " AND assignment_id = $2"
+                q += " AND l.assignment_id = $2"
                 params.append(uuid.UUID(assignment_id))
-            q += " ORDER BY processed_at DESC"
+            q += " ORDER BY l.processed_at DESC"
             async with self.connection() as conn:
                 rows = await conn.fetch(q, *params)
                 return [dict(row) for row in rows]

@@ -279,7 +279,9 @@ async def submit_assignment(
         submission = await db.create_assignment_submission({
             "assignment_id": assignment_id,
             "student_account_id": student_id,
+            "class_id": str(cls["id"]),
             "submission_text": body.submission_text,
+            "source": "student_portal",
             "status": "submitted",
             "submitted_at": datetime.utcnow().isoformat(),
         })

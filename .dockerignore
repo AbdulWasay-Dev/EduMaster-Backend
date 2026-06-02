@@ -53,6 +53,10 @@ Thumbs.db
 *.swo
 
 # ── Git ───────────────────────────────────────────────────────────────────────
+# CI / infrastructure
+.github/
+infra/
+
 .git/
 .gitignore
 

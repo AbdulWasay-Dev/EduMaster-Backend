@@ -68,22 +68,28 @@ setup_security_middleware(app, settings)
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=".*",  # Allow all origins in development
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # Add trusted host middleware for production
-if settings.environment == "production":
+if (
+    settings.environment == "production"
+    and settings.allowed_hosts
+    and "*" not in settings.allowed_hosts
+):
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=["yourdomain.com", "*.yourdomain.com"]
+        allowed_hosts=settings.allowed_hosts,
     )
 
 # Mount static files
-# Ensure static assets directory exists in fresh setups.
+# Ensure static and upload asset directories exist in fresh setups.
 Path("static").mkdir(exist_ok=True)
+Path(settings.upload_path).mkdir(parents=True, exist_ok=True)
+app.mount("/static/uploads", StaticFiles(directory=settings.upload_path), name="uploads")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
