@@ -5,6 +5,7 @@ NOTE: Static routes (email/*, generate-content) MUST come before /{assignment_id
 """
 import logging, os, uuid, json, re
 from datetime import datetime, timezone
+from email.utils import parseaddr
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
@@ -52,6 +53,11 @@ class EmailConfigRequest(BaseModel):
     app_password: str
     imap_host: str = "imap.gmail.com"
     imap_port: int = 993
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False
+    from_name: Optional[str] = None
     is_active: bool = True
 
 class GenerateContentRequest(BaseModel):
@@ -79,6 +85,51 @@ def _assignment_email_subject(title: str, assignment_id: str) -> str:
     return f"[{_assignment_email_code(assignment_id)}] {title}".strip()
 
 
+def _normalize_email(value: Any) -> str:
+    parsed = parseaddr(str(value or ""))[1]
+    return (parsed or str(value or "")).strip().lower()
+
+
+def _clean_email_submission_copy(value: Any) -> str:
+    """Normalize stale email-submission instructions in generated assignment copy."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    cleaned = re.sub(
+        r"\[\s*(ASG-[A-Fa-f0-9]{8}|ASG-CODE)\s+(?:ROLL|RN|ROLL\s*(?:NO|NUMBER))[^\]\n]*\]",
+        r"[\1]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    chunks = re.split(r"(?<=[.!?])\s+|\r?\n+", cleaned)
+    kept: list[str] = []
+    removed_stale_submission_rule = False
+    for chunk in chunks:
+        line = chunk.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        mentions_submission = any(
+            token in lowered
+            for token in ("email", "subject", "assignment code", " code", "submission", "submit")
+        )
+        if "roll" in lowered and mentions_submission:
+            removed_stale_submission_rule = True
+            continue
+        kept.append(line)
+
+    cleaned = "\n".join(kept)
+    if removed_stale_submission_rule:
+        canonical = (
+            "Email submissions must be sent from the email address your teacher added to the class roster "
+            "and use the exact assignment code in the subject."
+        )
+        if canonical.lower() not in cleaned.lower():
+            cleaned = f"{cleaned}\n{canonical}".strip()
+    return cleaned
+
+
 def _ser(a: dict) -> dict:
     assignment_id = str(a["id"])
     return {
@@ -90,7 +141,7 @@ def _ser(a: dict) -> dict:
         "class_name": a.get("class_name"),
         "title": a.get("title", ""),
         "description": a.get("description"),
-        "instructions": a.get("instructions"),
+        "instructions": _clean_email_submission_copy(a.get("instructions")),
         "total_marks": a.get("total_marks", 10),
         "due_date": str(a["due_date"]) if a.get("due_date") else None,
         "attachment_url": a.get("attachment_url"),
@@ -118,7 +169,7 @@ def _ser_sub(s: dict) -> dict:
         "assignment_id": str(s["assignment_id"]),
         "assignment_title": s.get("assignment_title"),
         "assignment_due_date": str(s["assignment_due_date"]) if s.get("assignment_due_date") else None,
-        "student_account_id": str(s["student_account_id"]),
+        "student_id": str(s["student_id"]) if s.get("student_id") else None,
         "student_name": s.get("student_name", ""),
         "student_email": s.get("student_email", ""),
         "roll_number": s.get("roll_number"),
@@ -140,7 +191,7 @@ def _ser_sub(s: dict) -> dict:
         "submitted_at": str(s["submitted_at"]) if s.get("submitted_at") else None,
         "graded_at": str(s["graded_at"]) if s.get("graded_at") else None,
         "created_at": str(s["created_at"]),
-        "source": s.get("source", "direct"),
+        "source": s.get("source", "manual"),
     }
 
 def _ser_email_log(log: dict) -> dict:
@@ -159,9 +210,10 @@ def _ser_email_log(log: dict) -> dict:
         "class_name": log.get("class_name"),
         "subject_id": str(log["subject_id"]) if log.get("subject_id") else None,
         "subject_name": log.get("subject_name"),
-        "student_account_id": str(log["student_account_id"]) if log.get("student_account_id") else None,
+        "student_id": str(log["student_id"]) if log.get("student_id") else None,
         "student_name": log.get("student_name"),
         "student_email": log.get("student_email"),
+        "student_roll_number": log.get("student_roll_number") or log.get("roll_number"),
         "email_from": log.get("email_from"),
         "email_subject": log.get("email_subject"),
         "email_body": log.get("email_body"),
@@ -232,15 +284,110 @@ def _normalize_generated_payload(data: dict, req: GenerateContentRequest) -> dic
     return {
         "assignment_name": str(data.get("assignment_name") or req.title).strip(),
         "description": str(data.get("description") or "").strip(),
-        "instructions": instructions,
+        "instructions": _clean_email_submission_copy(instructions),
         "grading_rubric": str(data.get("grading_rubric") or data.get("rubric") or "").strip(),
         "learning_objectives": objectives,
         "tasks": tasks,
         "deliverables": deliverables,
-        "submission_format": str(
+        "submission_format": _clean_email_submission_copy(str(
             data.get("submission_format") or "Submit one PDF or document file with your completed work."
-        ).strip(),
+        ).strip()),
         "email_subject_syntax": str(data.get("email_subject_syntax") or f"[ASG-CODE] {req.title}").strip(),
+        "assignment_type": req.assignment_type,
+        "difficulty_level": req.difficulty_level,
+        "estimated_duration": req.estimated_duration,
+    }
+
+
+def _allocate_marks(total_marks: int, parts: int) -> List[int]:
+    total = max(int(total_marks or 1), 1)
+    count = max(parts, 1)
+    base = total // count
+    marks = [base for _ in range(count)]
+    for idx in range(total % count):
+        marks[idx] += 1
+    return marks
+
+
+def _fallback_generated_payload(req: GenerateContentRequest, reason: str = "") -> dict:
+    class_label = req.class_name or "the selected class"
+    topic = (req.topic_hint or req.title or req.subject_name).strip()
+    assignment_type = (req.assignment_type or "assignment").replace("_", " ").strip()
+    difficulty = (req.difficulty_level or "medium").replace("_", " ").strip()
+    deliverables = _as_text_list(req.deliverables) or [
+        "Completed assignment document or PDF",
+        "Supporting calculations, references, diagrams, or evidence where required",
+        "Short conclusion or reflection summarizing what was learned",
+    ]
+    if req.requirements:
+        deliverables.append(f"Teacher requirement: {req.requirements.strip()}")
+
+    marks = _allocate_marks(req.total_marks, 4)
+    tasks = [
+        {
+            "title": "Concept Understanding",
+            "details": f"Explain the key ideas related to {topic} in your own words. Include definitions, important terms, and the connection to {req.subject_name}.",
+            "marks": marks[0],
+        },
+        {
+            "title": "Applied Work",
+            "details": f"Solve or complete a practical activity based on {topic}. Show clear working, reasoning, diagrams, code, or examples as appropriate for the subject.",
+            "marks": marks[1],
+        },
+        {
+            "title": "Analysis and Discussion",
+            "details": "Interpret your results and explain why your approach is valid. Compare alternatives, identify patterns, and mention limitations where relevant.",
+            "marks": marks[2],
+        },
+        {
+            "title": "Presentation and Submission Quality",
+        "details": "Organize the final work neatly with headings, readable formatting, student name, class-roster email, and all requested deliverables attached in one submission.",
+            "marks": marks[3],
+        },
+    ]
+
+    instructions = [
+        f"Complete this {assignment_type} for {class_label} in {req.subject_name}.",
+        f"Focus your work on: {topic}.",
+        f"Difficulty level: {difficulty}.",
+        "Read every task before starting and keep your answers organized under matching headings.",
+        "Submit one final PDF or document file. If submitting by email, send it from the email address your teacher added to the class roster and use the exact assignment code in the subject shown below.",
+        "The system maps email submissions by class-roster sender email plus assignment code.",
+    ]
+    if req.estimated_duration:
+        instructions.insert(3, f"Expected time: {req.estimated_duration}.")
+    if req.requirements:
+        instructions.insert(4, f"Additional teacher requirements: {req.requirements.strip()}")
+
+    rubric_lines = [
+        f"Concept accuracy and subject understanding: {marks[0]} marks",
+        f"Quality of applied work and method: {marks[1]} marks",
+        f"Analysis, reasoning, and explanation: {marks[2]} marks",
+        f"Presentation, completeness, and submission format: {marks[3]} marks",
+        f"Total: {sum(marks)} marks",
+    ]
+
+    if reason:
+        logger.warning("Using local assignment generation fallback: %s", reason)
+
+    return {
+        "assignment_name": req.title,
+        "description": (
+            f"This {assignment_type} is designed for {class_label} in {req.subject_name}. "
+            f"Students will demonstrate understanding of {topic}, apply the concept through structured work, "
+            "and submit a complete assignment that can be downloaded as a PDF and mapped through the email code."
+        ),
+        "instructions": "\n".join(f"{idx}. {text}" for idx, text in enumerate(instructions, start=1)),
+        "grading_rubric": "\n".join(rubric_lines),
+        "learning_objectives": [
+            f"Explain the core concepts of {topic} using correct {req.subject_name} vocabulary.",
+            "Apply the topic to a structured task with clear steps, evidence, and reasoning.",
+            "Present final work in a complete, organized format suitable for grading and email submission.",
+        ],
+        "tasks": tasks,
+        "deliverables": deliverables,
+        "submission_format": "Submit one PDF or document file. Email submissions must be sent from the student's class-roster email address and use the exact assignment code in the subject.",
+        "email_subject_syntax": f"[ASG-CODE] {req.title}",
         "assignment_type": req.assignment_type,
         "difficulty_level": req.difficulty_level,
         "estimated_duration": req.estimated_duration,
@@ -385,7 +532,7 @@ def _build_assignment_pdf(
         ]))
         story.append(task_table)
 
-    instructions = assignment.get("instructions") or outline.get("instructions")
+    instructions = _clean_email_submission_copy(assignment.get("instructions") or outline.get("instructions"))
     if instructions:
         story.extend([Paragraph("Instructions", section_style), p(instructions)])
 
@@ -401,9 +548,9 @@ def _build_assignment_pdf(
 
     story.extend([
         Paragraph("Email Submission", section_style),
-        p(f"To submit by email, use the subject {_assignment_email_subject(title, assignment_id)} and attach your completed PDF or document. The system uses this code to map the submission to the correct assignment, class, and subject."),
+        p(f"Email submission subject format: {_assignment_email_subject(title, assignment_id)}. Send the email from the email address your teacher added to the class roster and attach one completed PDF or document. The system uses that roster email address and this assignment code to map your submission to the correct student, assignment, class, and subject."),
         Spacer(1, 12),
-        p("Student Name: ________________________________     Roll No: ____________________"),
+        p("Student Name: ________________________________     Registered Email: ________________________________"),
     ])
 
     doc.build(story)
@@ -448,6 +595,15 @@ async def _validate_assignment_scope(db, user, class_id: str, subject_id: str):
 
     return cls, subject
 
+
+async def _resolve_roster_student_for_submission(db, class_id: str, student_ref_id: str) -> dict:
+    roster_student = await db.get_student(student_ref_id)
+    if roster_student and str(roster_student.get("class_id")) == class_id:
+        return roster_student
+
+    raise HTTPException(400, "Selected student was not found in this assignment class roster")
+
+
 async def _own(db, user, aid):
     a = await db.get_assignment(aid)
     if not a:
@@ -471,21 +627,6 @@ async def _do_grade(db, a, sub):
         "graded_at": datetime.utcnow(),
     }
     updated = await db.update_assignment_submission(str(sub["id"]), upd)
-    try:
-        await db.create_student_score({
-            "student_account_id": str(sub["student_account_id"]),
-            "class_id": str(a["class_id"]),
-            "subject_id": str(a["subject_id"]),
-            "score_type": "assignment",
-            "reference_id": str(a["id"]),
-            "title": a["title"],
-            "marks_obtained": result["marks_obtained"],
-            "max_marks": a.get("total_marks", 10),
-            "percentage": result["percentage"],
-            "grade": result["grade"],
-        })
-    except Exception as e:
-        logger.warning(f"Score record failed: {e}")
     return updated or sub
 
 
@@ -497,14 +638,8 @@ async def generate_assignment_content(
     current_user: dict = Depends(require_teacher()),
 ):
     """Use AI to auto-generate description, instructions, and grading rubric."""
-    try:
-        from groq import AsyncGroq
-        from config import get_settings
-        settings = get_settings()
-        client = AsyncGroq(api_key=settings.groq_api_key)
-
-        deliverables = ", ".join(req.deliverables or []) or "PDF or document submission"
-        prompt = f"""You are an expert teacher creating a complete, classroom-ready assignment.
+    deliverables = ", ".join(req.deliverables or []) or "PDF or document submission"
+    prompt = f"""You are an expert teacher creating a complete, classroom-ready assignment.
 
 ASSIGNMENT CONTEXT
 - Title: {req.title}
@@ -521,7 +656,8 @@ ASSIGNMENT CONTEXT
 Create a proper assignment sheet that a teacher can publish directly.
 Use clear student-facing language. Split the marks across 3 to 6 meaningful tasks.
 Make the grading rubric add up to {req.total_marks} marks.
-Use the placeholder [ASG-CODE] in the email subject; the real code is assigned when the assignment is saved.
+Use the placeholder [ASG-CODE] in the email subject; the real assignment code is assigned when the assignment is saved. Students must send email submissions from the email address their teacher added to the class roster.
+Only describe email submission mapping through the class-roster sender email address and assignment code.
 
 Return ONLY valid JSON (no markdown fences) with this exact schema:
 {{
@@ -538,29 +674,50 @@ Return ONLY valid JSON (no markdown fences) with this exact schema:
   "grading_rubric": "<rubric with mark allocation that totals {req.total_marks} marks>"
 }}
 """
-        response = await client.chat.completions.create(
-            model=settings.groq_llm_model,
-            messages=[
-                {"role": "system", "content": "You are an expert teacher who creates clear, well-structured assignments. Always respond with valid JSON only."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.65,
-            max_tokens=1800,
-        )
-        raw = response.choices[0].message.content.strip()
-        # Strip markdown fences if present
-        if raw.startswith("```"):
-            lines = raw.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            raw = "\n".join(lines)
-        data = json.loads(raw)
-        return _normalize_generated_payload(data, req)
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error in generate-content: {e}")
-        raise HTTPException(500, "AI returned malformed content. Please try again.")
+    try:
+        from groq import AsyncGroq
+        from config import get_settings
+        settings = get_settings()
     except Exception as e:
-        logger.error(f"AI generate-content failed: {e}")
-        raise HTTPException(500, f"AI generation failed: {str(e)}")
+        return _fallback_generated_payload(req, f"AI client unavailable: {e}")
+
+    api_keys = [
+        key.strip()
+        for key in getattr(settings, "all_groq_keys", [])
+        if key and key.strip() and "placeholder" not in key.strip().lower()
+    ]
+    if not api_keys:
+        return _fallback_generated_payload(req, "No Groq API key configured")
+
+    last_error: Optional[Exception] = None
+    for api_key in api_keys:
+        try:
+            client = AsyncGroq(api_key=api_key)
+            response = await client.chat.completions.create(
+                model=settings.groq_llm_model,
+                messages=[
+                    {"role": "system", "content": "You are an expert teacher who creates clear, well-structured assignments. Always respond with valid JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.65,
+                max_tokens=1800,
+            )
+            raw = response.choices[0].message.content.strip()
+            # Strip markdown fences if present
+            if raw.startswith("```"):
+                lines = raw.split("\n")
+                lines = [line for line in lines if not line.strip().startswith("```")]
+                raw = "\n".join(lines)
+            data = json.loads(raw)
+            return _normalize_generated_payload(data, req)
+        except json.JSONDecodeError as e:
+            logger.warning("AI assignment generation returned malformed JSON: %s", e)
+            return _fallback_generated_payload(req, "AI returned malformed JSON")
+        except Exception as e:
+            last_error = e
+            logger.warning("AI assignment generation failed with a configured Groq key: %s", e)
+
+    return _fallback_generated_payload(req, str(last_error) if last_error else "AI generation unavailable")
 
 
 # ─── Email Config  (STATIC — must be before /{assignment_id}) ─────────────────
@@ -576,6 +733,11 @@ async def get_email_config(current_user: dict = Depends(require_teacher())):
         "email_address": result["email_address"],
         "imap_host": result["imap_host"],
         "imap_port": result["imap_port"],
+        "smtp_host": result.get("smtp_host") or "smtp.gmail.com",
+        "smtp_port": result.get("smtp_port") or 587,
+        "smtp_use_tls": result.get("smtp_use_tls", True),
+        "smtp_use_ssl": result.get("smtp_use_ssl", False),
+        "from_name": result.get("from_name"),
         "is_active": result["is_active"],
         "last_fetched_at": str(result["last_fetched_at"]) if result.get("last_fetched_at") else None,
     }
@@ -591,15 +753,35 @@ async def save_email_config(data: EmailConfigRequest, current_user: dict = Depen
         "email_address": result["email_address"],
         "imap_host": result["imap_host"],
         "imap_port": result["imap_port"],
+        "smtp_host": result.get("smtp_host") or "smtp.gmail.com",
+        "smtp_port": result.get("smtp_port") or 587,
+        "smtp_use_tls": result.get("smtp_use_tls", True),
+        "smtp_use_ssl": result.get("smtp_use_ssl", False),
+        "from_name": result.get("from_name"),
         "is_active": result["is_active"],
         "last_fetched_at": str(result["last_fetched_at"]) if result.get("last_fetched_at") else None,
     }
 
 @router.post("/email/test-connection")
 async def test_email_connection(data: EmailConfigRequest, current_user: dict = Depends(require_teacher())):
-    from services.email_service import EmailFetcher
+    from services.email_service import EmailFetcher, EmailSender
     fetcher = EmailFetcher(data.email_address, data.app_password, data.imap_host, data.imap_port)
-    return fetcher.test_connection()
+    imap_result = fetcher.test_connection()
+    sender = EmailSender(
+        data.email_address,
+        data.app_password,
+        data.smtp_host,
+        data.smtp_port,
+        data.smtp_use_tls,
+        data.smtp_use_ssl,
+        data.from_name,
+    )
+    smtp_result = sender.test_connection()
+    success = bool(imap_result.get("success") and smtp_result.get("success"))
+    return {
+        "success": success,
+        "message": f"IMAP: {imap_result.get('message')}. SMTP: {smtp_result.get('message')}.",
+    }
 
 
 # ─── Assignment CRUD ───────────────────────────────────────────────────────────
@@ -614,7 +796,7 @@ async def create_assignment(data: AssignmentCreate, current_user: dict = Depends
         "class_id": data.class_id,
         "title": data.title,
         "description": data.description,
-        "instructions": data.instructions,
+        "instructions": _clean_email_submission_copy(data.instructions),
         "total_marks": data.total_marks,
         "due_date": _parse_due(data.due_date),
         "attachment_url": data.attachment_url,
@@ -663,6 +845,8 @@ async def update_assignment(assignment_id: str, data: AssignmentUpdate, current_
     await _validate_assignment_scope(db, current_user, next_class_id, next_subject_id)
     if "due_date" in upd:
         upd["due_date"] = _parse_due(upd["due_date"])
+    if "instructions" in upd:
+        upd["instructions"] = _clean_email_submission_copy(upd["instructions"])
     updated = await db.update_assignment(assignment_id, upd)
     return _ser(updated)
 
@@ -834,7 +1018,7 @@ async def get_analytics(assignment_id: str, current_user: dict = Depends(require
     db = await get_database()
     a = await _own(db, current_user, assignment_id)
     subs = await db.get_assignment_submissions(assignment_id)
-    students = await db.get_student_accounts_by_class(str(a["class_id"]))
+    students = await db.get_students(str(a["class_id"]))
     graded = [s for s in subs if s.get("status") in ("graded", "returned")]
     scores = [float(s["marks_obtained"]) for s in graded if s.get("marks_obtained") is not None]
     avg = round(sum(scores) / len(scores), 2) if scores else 0
@@ -862,13 +1046,16 @@ async def get_analytics(assignment_id: str, current_user: dict = Depends(require
 @router.post("/{assignment_id}/manual-upload")
 async def manual_upload(
     assignment_id: str,
-    student_account_id: str = Form(...),
+    student_id: Optional[str] = Form(None),
     submission_text: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     current_user: dict = Depends(require_teacher()),
 ):
     db = await get_database()
     a = await _own(db, current_user, assignment_id)
+    if not student_id:
+        raise HTTPException(400, "Please select a student from the class roster")
+    roster_student = await _resolve_roster_student_for_submission(db, str(a["class_id"]), student_id)
     file_paths = []
     if file and file.filename:
         d = os.path.join("uploads", "submissions", assignment_id)
@@ -880,7 +1067,7 @@ async def manual_upload(
 
     sub = await db.create_assignment_submission({
         "assignment_id": assignment_id,
-        "student_account_id": student_account_id,
+        "student_id": str(roster_student["id"]),
         "class_id": str(a["class_id"]),
         "submission_text": submission_text or "",
         "submission_files": file_paths,
@@ -920,13 +1107,18 @@ async def fetch_email_submissions(assignment_id: str, current_user: dict = Depen
     except Exception as e:
         raise HTTPException(500, f"Failed to fetch emails: {e}")
 
-    students = await db.get_student_accounts_by_class(str(a["class_id"]))
-    email_to_student = {s["email"].lower(): s for s in students if s.get("email")}
+    class_id = str(a["class_id"])
+    roster_students = await db.get_students(class_id)
+    roster_email_to_student = {
+        _normalize_email(s.get("email")): s
+        for s in roster_students
+        if _normalize_email(s.get("email"))
+    }
     processed, skipped = 0, 0
 
     for mail_data in emails:
-        sender = mail_data["from_email"].lower()
-        student = email_to_student.get(sender)
+        sender = _normalize_email(mail_data.get("from_email") or mail_data.get("from_name"))
+        student = roster_email_to_student.get(sender)
         log_base = {
             "teacher_id": current_user["id"],
             "assignment_id": assignment_id,
@@ -937,17 +1129,21 @@ async def fetch_email_submissions(assignment_id: str, current_user: dict = Depen
             "processed_at": datetime.utcnow(),
         }
         if not student:
-            await db.create_email_submission_log({**log_base, "status": "skipped", "notes": f"Sender not in class roster. Expected subject code: {assignment_code}"})
+            await db.create_email_submission_log({
+                **log_base,
+                "status": "skipped",
+                "notes": f"Assignment code matched, but the sender email is not in the teacher's roster for {a.get('class_name') or 'this class'}. Students must send from the email address saved in the class roster and use the subject {_assignment_email_subject(a.get('title') or 'Assignment', assignment_id)}.",
+            })
             skipped += 1
             continue
         if not mail_data.get("body") and not mail_data.get("attachments"):
-            await db.create_email_submission_log({**log_base, "student_account_id": str(student["id"]), "status": "skipped", "notes": "No message body or attachment found"})
+            await db.create_email_submission_log({**log_base, "student_id": str(student["id"]), "status": "skipped", "notes": "No message body or attachment found"})
             skipped += 1
             continue
         pdf_count = sum(1 for path in mail_data.get("attachments", []) if str(path).lower().endswith(".pdf"))
         sub = await db.create_assignment_submission({
             "assignment_id": assignment_id,
-            "student_account_id": str(student["id"]),
+            "student_id": str(student["id"]),
             "class_id": str(a["class_id"]),
             "submission_text": mail_data["body"],
             "submission_files": mail_data["attachments"],
@@ -956,13 +1152,14 @@ async def fetch_email_submissions(assignment_id: str, current_user: dict = Depen
             "submitted_at": datetime.utcnow(),
         })
         if sub:
-            notes = f"Mapped by {assignment_code} to {a.get('class_name') or 'selected class'} / {a.get('subject_name') or 'selected subject'}."
+            notes = f"Mapped by class-roster sender email {sender} and {assignment_code} to {student.get('student_name') or 'student'}"
+            notes += f" in {a.get('class_name') or 'selected class'} / {a.get('subject_name') or 'selected subject'}."
             if pdf_count:
                 notes += f" Imported {pdf_count} PDF attachment{'s' if pdf_count != 1 else ''}."
-            await db.create_email_submission_log({**log_base, "student_account_id": str(student["id"]), "status": "processed", "notes": notes})
+            await db.create_email_submission_log({**log_base, "student_id": str(student["id"]), "status": "processed", "notes": notes})
             processed += 1
         else:
-            await db.create_email_submission_log({**log_base, "student_account_id": str(student["id"]), "status": "failed", "notes": "Could not create or update submission"})
+            await db.create_email_submission_log({**log_base, "student_id": str(student["id"]), "status": "failed", "notes": "Could not create or update submission"})
             skipped += 1
 
     await db.update_email_last_fetched(current_user["id"])
@@ -971,7 +1168,7 @@ async def fetch_email_submissions(assignment_id: str, current_user: dict = Depen
             "email_subject_syntax": _assignment_email_subject(a.get("title", ""), assignment_id),
             "class_name": a.get("class_name"),
             "subject_name": a.get("subject_name"),
-            "message": f"Processed {processed} submissions, skipped {skipped} unknown senders"}
+            "message": f"Processed {processed} submissions, skipped {skipped} emails not sent from a class-roster email address"}
 
 @router.get("/{assignment_id}/email-logs")
 async def get_email_logs(assignment_id: str, current_user: dict = Depends(require_teacher())):

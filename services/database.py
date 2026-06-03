@@ -231,6 +231,10 @@ class DatabaseService:
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
 
+    ALTER TABLE student_accounts ADD COLUMN IF NOT EXISTS roll_number TEXT;
+    ALTER TABLE student_accounts ADD COLUMN IF NOT EXISTS student_id TEXT;
+    ALTER TABLE student_accounts ADD COLUMN IF NOT EXISTS student_record_id UUID REFERENCES students(id) ON DELETE SET NULL;
+
     CREATE TABLE IF NOT EXISTS assignments (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         teacher_id UUID REFERENCES teachers(id) ON DELETE CASCADE NOT NULL,
@@ -256,7 +260,8 @@ class DatabaseService:
     CREATE TABLE IF NOT EXISTS assignment_submissions (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         assignment_id UUID REFERENCES assignments(id) ON DELETE CASCADE NOT NULL,
-        student_account_id UUID REFERENCES student_accounts(id) ON DELETE CASCADE NOT NULL,
+        student_id UUID REFERENCES students(id) ON DELETE CASCADE,
+        student_account_id UUID REFERENCES student_accounts(id) ON DELETE SET NULL,
         class_id UUID REFERENCES classes(id) ON DELETE CASCADE NOT NULL,
         submission_text TEXT,
         submission_files JSONB DEFAULT '[]',
@@ -268,7 +273,7 @@ class DatabaseService:
         ai_rubric_breakdown JSONB,
         teacher_remarks TEXT,
         teacher_override_marks NUMERIC(5,2),
-        source TEXT DEFAULT 'student_portal',
+        source TEXT DEFAULT 'manual',
         status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'submitted', 'grading', 'graded', 'returned')),
         submitted_at TIMESTAMP WITH TIME ZONE,
         graded_at TIMESTAMP WITH TIME ZONE,
@@ -277,7 +282,14 @@ class DatabaseService:
         UNIQUE (assignment_id, student_account_id)
     );
 
-    ALTER TABLE assignment_submissions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'student_portal';
+    ALTER TABLE assignment_submissions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'manual';
+    ALTER TABLE assignment_submissions ALTER COLUMN source SET DEFAULT 'manual';
+    ALTER TABLE assignment_submissions ADD COLUMN IF NOT EXISTS student_id UUID REFERENCES students(id) ON DELETE CASCADE;
+    ALTER TABLE assignment_submissions ALTER COLUMN student_account_id DROP NOT NULL;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_asub_assignment_roster_student
+        ON assignment_submissions(assignment_id, student_id)
+        WHERE student_id IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS student_scores (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -396,6 +408,7 @@ class DatabaseService:
     CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
     CREATE INDEX IF NOT EXISTS idx_asub_assignment ON assignment_submissions(assignment_id);
     CREATE INDEX IF NOT EXISTS idx_asub_student ON assignment_submissions(student_account_id);
+    CREATE INDEX IF NOT EXISTS idx_asub_roster_student ON assignment_submissions(student_id);
     CREATE INDEX IF NOT EXISTS idx_asub_status ON assignment_submissions(status);
     CREATE INDEX IF NOT EXISTS idx_scores_student ON student_scores(student_account_id);
     CREATE INDEX IF NOT EXISTS idx_scores_class ON student_scores(class_id);
@@ -492,17 +505,28 @@ class DatabaseService:
         email_address TEXT NOT NULL,
         imap_host TEXT NOT NULL DEFAULT 'imap.gmail.com',
         imap_port INTEGER NOT NULL DEFAULT 993,
+        smtp_host TEXT NOT NULL DEFAULT 'smtp.gmail.com',
+        smtp_port INTEGER NOT NULL DEFAULT 587,
+        smtp_use_tls BOOLEAN DEFAULT TRUE,
+        smtp_use_ssl BOOLEAN DEFAULT FALSE,
+        from_name TEXT,
         app_password TEXT NOT NULL,
         is_active BOOLEAN DEFAULT TRUE,
         last_fetched_at TIMESTAMP WITH TIME ZONE,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
+    ALTER TABLE email_integrations ADD COLUMN IF NOT EXISTS smtp_host TEXT NOT NULL DEFAULT 'smtp.gmail.com';
+    ALTER TABLE email_integrations ADD COLUMN IF NOT EXISTS smtp_port INTEGER NOT NULL DEFAULT 587;
+    ALTER TABLE email_integrations ADD COLUMN IF NOT EXISTS smtp_use_tls BOOLEAN DEFAULT TRUE;
+    ALTER TABLE email_integrations ADD COLUMN IF NOT EXISTS smtp_use_ssl BOOLEAN DEFAULT FALSE;
+    ALTER TABLE email_integrations ADD COLUMN IF NOT EXISTS from_name TEXT;
 
     CREATE TABLE IF NOT EXISTS email_submission_logs (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         teacher_id UUID REFERENCES teachers(id) ON DELETE CASCADE NOT NULL,
         assignment_id UUID REFERENCES assignments(id) ON DELETE SET NULL,
+        student_id UUID REFERENCES students(id) ON DELETE SET NULL,
         student_account_id UUID REFERENCES student_accounts(id) ON DELETE SET NULL,
         email_from TEXT,
         email_subject TEXT,
@@ -512,10 +536,12 @@ class DatabaseService:
         status TEXT DEFAULT 'processed' CHECK (status IN ('processed', 'failed', 'skipped')),
         notes TEXT
     );
+    ALTER TABLE email_submission_logs ADD COLUMN IF NOT EXISTS student_id UUID REFERENCES students(id) ON DELETE SET NULL;
 
     CREATE INDEX IF NOT EXISTS idx_email_integrations_teacher ON email_integrations(teacher_id);
     CREATE INDEX IF NOT EXISTS idx_email_logs_teacher ON email_submission_logs(teacher_id);
     CREATE INDEX IF NOT EXISTS idx_email_logs_assignment ON email_submission_logs(assignment_id);
+    CREATE INDEX IF NOT EXISTS idx_email_logs_roster_student ON email_submission_logs(student_id);
 
     CREATE INDEX IF NOT EXISTS idx_attendance_teacher ON attendance_records(teacher_id);
     CREATE INDEX IF NOT EXISTS idx_attendance_student ON attendance_records(student_id);
@@ -1440,8 +1466,8 @@ class DatabaseService:
                     """
                     INSERT INTO student_accounts
                         (id, full_name, email, password_hash, phone, date_of_birth, gender,
-                         profile_image_url, roll_number, student_id, class_id, is_verified)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                         profile_image_url, roll_number, student_id, class_id, student_record_id, is_verified)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                     RETURNING *
                     """,
                     uuid.UUID(sid),
@@ -1455,6 +1481,7 @@ class DatabaseService:
                     data.get("roll_number"),
                     data.get("student_id"),
                     uuid.UUID(data["class_id"]) if data.get("class_id") else None,
+                    uuid.UUID(data["student_record_id"]) if data.get("student_record_id") else None,
                     data.get("is_verified", False),
                 )
                 return dict(row) if row else None
@@ -1513,10 +1540,15 @@ class DatabaseService:
     async def get_student_accounts_by_class(self, class_id: str, verified_only: bool = False) -> List[Dict[str, Any]]:
         """Get all student accounts in a class"""
         try:
-            q = "SELECT * FROM student_accounts WHERE class_id = $1"
+            q = """
+                SELECT DISTINCT sa.*
+                FROM student_accounts sa
+                LEFT JOIN students st ON st.id = sa.student_record_id
+                WHERE (sa.class_id = $1 OR st.class_id = $1)
+            """
             if verified_only:
-                q += " AND is_verified = TRUE"
-            q += " ORDER BY full_name"
+                q += " AND sa.is_verified = TRUE"
+            q += " ORDER BY sa.full_name"
             async with self.connection() as conn:
                 rows = await conn.fetch(q, uuid.UUID(class_id))
                 return [dict(row) for row in rows]
@@ -1729,32 +1761,64 @@ class DatabaseService:
         """Create or update an assignment submission"""
         try:
             sid = data.get("id") or str(uuid.uuid4())
+            roster_student_id = data.get("student_id")
+            student_account_id = data.get("student_account_id")
             async with self.connection() as conn:
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO assignment_submissions
-                        (id, assignment_id, student_account_id, class_id,
-                         submission_text, submission_files, source, status, submitted_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-                    ON CONFLICT (assignment_id, student_account_id) DO UPDATE SET
-                        submission_text = EXCLUDED.submission_text,
-                        submission_files = EXCLUDED.submission_files,
-                        source = EXCLUDED.source,
-                        status = EXCLUDED.status,
-                        submitted_at = EXCLUDED.submitted_at,
-                        updated_at = NOW()
-                    RETURNING *
-                    """,
-                    uuid.UUID(sid),
-                    uuid.UUID(data["assignment_id"]),
-                    uuid.UUID(data["student_account_id"]),
-                    uuid.UUID(data["class_id"]),
-                    data.get("submission_text"),
-                    json.dumps(data.get("submission_files", [])),
-                    data.get("source", "student_portal"),
-                    data.get("status", "submitted"),
-                    data.get("submitted_at"),
-                )
+                if roster_student_id:
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO assignment_submissions
+                            (id, assignment_id, student_id, student_account_id, class_id,
+                             submission_text, submission_files, source, status, submitted_at)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                        ON CONFLICT (assignment_id, student_id) WHERE student_id IS NOT NULL DO UPDATE SET
+                            student_account_id = COALESCE(EXCLUDED.student_account_id, assignment_submissions.student_account_id),
+                            class_id = EXCLUDED.class_id,
+                            submission_text = EXCLUDED.submission_text,
+                            submission_files = EXCLUDED.submission_files,
+                            source = EXCLUDED.source,
+                            status = EXCLUDED.status,
+                            submitted_at = EXCLUDED.submitted_at,
+                            updated_at = NOW()
+                        RETURNING *
+                        """,
+                        uuid.UUID(sid),
+                        uuid.UUID(data["assignment_id"]),
+                        uuid.UUID(roster_student_id),
+                        uuid.UUID(student_account_id) if student_account_id else None,
+                        uuid.UUID(data["class_id"]),
+                        data.get("submission_text"),
+                        json.dumps(data.get("submission_files", [])),
+                        data.get("source", "manual"),
+                        data.get("status", "submitted"),
+                        data.get("submitted_at"),
+                    )
+                else:
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO assignment_submissions
+                            (id, assignment_id, student_account_id, class_id,
+                             submission_text, submission_files, source, status, submitted_at)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                        ON CONFLICT (assignment_id, student_account_id) DO UPDATE SET
+                            submission_text = EXCLUDED.submission_text,
+                            submission_files = EXCLUDED.submission_files,
+                            source = EXCLUDED.source,
+                            status = EXCLUDED.status,
+                            submitted_at = EXCLUDED.submitted_at,
+                            updated_at = NOW()
+                        RETURNING *
+                        """,
+                        uuid.UUID(sid),
+                        uuid.UUID(data["assignment_id"]),
+                        uuid.UUID(student_account_id),
+                        uuid.UUID(data["class_id"]),
+                        data.get("submission_text"),
+                        json.dumps(data.get("submission_files", [])),
+                        data.get("source", "manual"),
+                        data.get("status", "submitted"),
+                        data.get("submitted_at"),
+                    )
                 return dict(row) if row else None
         except Exception as e:
             logger.error(f"Error creating assignment submission: {e}")
@@ -1773,13 +1837,14 @@ class DatabaseService:
                         a.due_date AS assignment_due_date,
                         c.name AS class_name,
                         subj.name AS subject_name,
-                        sa.full_name AS student_name,
-                        sa.roll_number,
-                        sa.email AS student_email
+                        COALESCE(st.student_name, sa.full_name) AS student_name,
+                        COALESCE(st.student_id, sa.roll_number) AS roll_number,
+                        COALESCE(st.email, sa.email) AS student_email
                     FROM assignment_submissions s
                     JOIN assignments a ON a.id = s.assignment_id
                     LEFT JOIN classes c ON c.id = s.class_id
                     LEFT JOIN subjects subj ON subj.id = a.subject_id
+                    LEFT JOIN students st ON st.id = s.student_id
                     LEFT JOIN student_accounts sa ON sa.id = s.student_account_id
                     WHERE s.id = $1
                     """,
@@ -1790,14 +1855,19 @@ class DatabaseService:
             logger.error(f"Error getting assignment submission {submission_id}: {e}")
             return None
 
-    async def get_assignment_submission_by_student(self, assignment_id: str, student_account_id: str) -> Optional[Dict[str, Any]]:
+    async def get_assignment_submission_by_student(self, assignment_id: str, student_id: str) -> Optional[Dict[str, Any]]:
         """Get a student's submission for an assignment"""
         try:
             async with self.connection() as conn:
                 row = await conn.fetchrow(
-                    "SELECT * FROM assignment_submissions WHERE assignment_id = $1 AND student_account_id = $2",
+                    """
+                    SELECT *
+                    FROM assignment_submissions
+                    WHERE assignment_id = $1
+                      AND (student_id = $2 OR student_account_id = $2)
+                    """,
                     uuid.UUID(assignment_id),
-                    uuid.UUID(student_account_id),
+                    uuid.UUID(student_id),
                 )
                 return dict(row) if row else None
         except Exception as e:
@@ -1817,14 +1887,15 @@ class DatabaseService:
                         a.due_date AS assignment_due_date,
                         c.name AS class_name,
                         subj.name AS subject_name,
-                        sa.full_name AS student_name,
-                        sa.roll_number,
-                        sa.email AS student_email
+                        COALESCE(st.student_name, sa.full_name) AS student_name,
+                        COALESCE(st.student_id, sa.roll_number) AS roll_number,
+                        COALESCE(st.email, sa.email) AS student_email
                     FROM assignment_submissions s
                     JOIN assignments a ON a.id = s.assignment_id
                     LEFT JOIN classes c ON c.id = s.class_id
                     LEFT JOIN subjects subj ON subj.id = a.subject_id
-                    JOIN student_accounts sa ON sa.id = s.student_account_id
+                    LEFT JOIN students st ON st.id = s.student_id
+                    LEFT JOIN student_accounts sa ON sa.id = s.student_account_id
                     WHERE s.assignment_id = $1
                     ORDER BY s.submitted_at DESC NULLS LAST
                     """,
@@ -1862,7 +1933,7 @@ class DatabaseService:
             logger.error(f"Error updating assignment submission {submission_id}: {e}")
             return None
 
-    async def get_student_submissions(self, student_account_id: str) -> List[Dict[str, Any]]:
+    async def get_student_submissions(self, student_id: str) -> List[Dict[str, Any]]:
         """Get all submissions for a student across assignments"""
         try:
             async with self.connection() as conn:
@@ -1872,14 +1943,14 @@ class DatabaseService:
                            a.due_date as assignment_due_date, a.subject_id
                     FROM assignment_submissions s
                     JOIN assignments a ON a.id = s.assignment_id
-                    WHERE s.student_account_id = $1
+                    WHERE s.student_id = $1 OR s.student_account_id = $1
                     ORDER BY s.submitted_at DESC NULLS LAST
                     """,
-                    uuid.UUID(student_account_id),
+                    uuid.UUID(student_id),
                 )
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error getting submissions for student {student_account_id}: {e}")
+            logger.error(f"Error getting submissions for student {student_id}: {e}")
             return []
 
     # ==================== Student Scores Operations ====================
@@ -2490,11 +2561,16 @@ class DatabaseService:
     async def get_student_accounts_by_class(self, class_id: str, verified_only: bool = False) -> List[Dict[str, Any]]:
         """Get all student accounts for a class"""
         try:
-            q = "SELECT * FROM student_accounts WHERE class_id = $1"
+            q = """
+                SELECT DISTINCT sa.*
+                FROM student_accounts sa
+                LEFT JOIN students st ON st.id = sa.student_record_id
+                WHERE (sa.class_id = $1 OR st.class_id = $1)
+            """
             params: list = [uuid.UUID(class_id)]
             if verified_only:
-                q += " AND is_verified = TRUE"
-            q += " ORDER BY full_name"
+                q += " AND sa.is_verified = TRUE"
+            q += " ORDER BY sa.full_name"
             async with self.connection() as conn:
                 rows = await conn.fetch(q, *params)
                 return [dict(row) for row in rows]
@@ -2510,12 +2586,19 @@ class DatabaseService:
             async with self.connection() as conn:
                 row = await conn.fetchrow(
                     """
-                    INSERT INTO email_integrations (teacher_id, email_address, imap_host, imap_port, app_password, is_active)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                    INSERT INTO email_integrations
+                        (teacher_id, email_address, imap_host, imap_port, smtp_host, smtp_port,
+                         smtp_use_tls, smtp_use_ssl, from_name, app_password, is_active)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     ON CONFLICT (teacher_id) DO UPDATE SET
                         email_address = EXCLUDED.email_address,
                         imap_host = EXCLUDED.imap_host,
                         imap_port = EXCLUDED.imap_port,
+                        smtp_host = EXCLUDED.smtp_host,
+                        smtp_port = EXCLUDED.smtp_port,
+                        smtp_use_tls = EXCLUDED.smtp_use_tls,
+                        smtp_use_ssl = EXCLUDED.smtp_use_ssl,
+                        from_name = EXCLUDED.from_name,
                         app_password = EXCLUDED.app_password,
                         is_active = EXCLUDED.is_active,
                         updated_at = NOW()
@@ -2525,6 +2608,11 @@ class DatabaseService:
                     config["email_address"],
                     config.get("imap_host", "imap.gmail.com"),
                     config.get("imap_port", 993),
+                    config.get("smtp_host", "smtp.gmail.com"),
+                    config.get("smtp_port", 587),
+                    config.get("smtp_use_tls", True),
+                    config.get("smtp_use_ssl", False),
+                    config.get("from_name"),
                     config["app_password"],
                     config.get("is_active", True),
                 )
@@ -2567,14 +2655,15 @@ class DatabaseService:
                 row = await conn.fetchrow(
                     """
                     INSERT INTO email_submission_logs
-                        (id, teacher_id, assignment_id, student_account_id, email_from,
+                        (id, teacher_id, assignment_id, student_id, student_account_id, email_from,
                          email_subject, email_body, attachment_paths, processed_at, status, notes)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                     RETURNING *
                     """,
                     uuid.UUID(lid),
                     uuid.UUID(data["teacher_id"]),
                     uuid.UUID(data["assignment_id"]) if data.get("assignment_id") else None,
+                    uuid.UUID(data["student_id"]) if data.get("student_id") else None,
                     uuid.UUID(data["student_account_id"]) if data.get("student_account_id") else None,
                     data.get("email_from"),
                     data.get("email_subject"),
@@ -2600,12 +2689,14 @@ class DatabaseService:
                     a.subject_id,
                     c.name AS class_name,
                     subj.name AS subject_name,
-                    sa.full_name AS student_name,
-                    sa.email AS student_email
+                    COALESCE(st.student_name, sa.full_name) AS student_name,
+                    COALESCE(st.email, sa.email) AS student_email,
+                    COALESCE(st.student_id, sa.roll_number) AS student_roll_number
                 FROM email_submission_logs l
                 LEFT JOIN assignments a ON a.id = l.assignment_id
                 LEFT JOIN classes c ON c.id = a.class_id
                 LEFT JOIN subjects subj ON subj.id = a.subject_id
+                LEFT JOIN students st ON st.id = l.student_id
                 LEFT JOIN student_accounts sa ON sa.id = l.student_account_id
                 WHERE l.teacher_id = $1
             """

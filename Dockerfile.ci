@@ -58,6 +58,7 @@ RUN set -eux; \
     pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torch==2.10.0"; \
     grep -v '^torch==' requirements.txt > /tmp/requirements-ci.txt; \
     pip install --no-cache-dir -r /tmp/requirements-ci.txt; \
+    python -m uvicorn --version; \
     apt-get purge -y --auto-remove build-essential gcc g++ git libpq-dev libffi-dev libssl-dev; \
     rm -rf /root/.cache/pip /tmp/* /var/tmp/*
 
@@ -83,7 +84,7 @@ HEALTHCHECK --interval=30s --timeout=15s --start-period=120s --retries=5 \
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
-CMD sh -c "uvicorn main:app \
+CMD sh -c "python -m uvicorn main:app \
     --host 0.0.0.0 \
     --port ${PORT:-8010} \
     --workers 1 \

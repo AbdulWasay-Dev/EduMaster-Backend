@@ -1,9 +1,15 @@
 """
 Answer Sheet Grading API endpoints
 """
+import csv
+import io
 import logging
-from typing import Optional, List, Any
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+import re
+from datetime import datetime
+from typing import Optional, List, Any, Dict
+from xml.sax.saxutils import escape
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from utils.security import get_current_teacher, require_teacher_or_admin
@@ -614,6 +620,30 @@ async def get_class_paper_results(
 # Endpoints required by the frontend API client (grading.ts)
 # ─────────────────────────────────────────────────────────────────────────────
 
+@router.get("/reports/paper/{paper_id}")
+async def export_paper_class_report(
+    paper_id: str,
+    format: str = Query("pdf", pattern="^(pdf|csv)$"),
+    class_id: Optional[str] = Query(None),
+    current_teacher: dict = Depends(require_teacher_or_admin()),
+):
+    """
+    Export a class report for one selected paper only.
+    Includes roster coverage, class/subject/paper header, and per-question marks.
+    """
+    try:
+        db = await get_database()
+        report = await _build_paper_class_report_data(db, paper_id, current_teacher, class_id_override=class_id)
+        if format.lower() == "csv":
+            return _build_report_csv_response(report)
+        return _build_report_pdf_response(report)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error exporting paper class report: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error while generating report")
+
+
 @router.get("/")
 async def list_submissions(
     paper_id: Optional[str] = None,
@@ -856,4 +886,747 @@ def _grade_label(percentage: float) -> str:
     if pct >= 50:
         return "D"
     return "F"
+
+
+async def _build_paper_class_report_data(
+    db,
+    paper_id: str,
+    current_teacher: dict,
+    class_id_override: Optional[str] = None,
+) -> Dict[str, Any]:
+    paper = await db.get_paper(paper_id)
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    if str(paper.get("owner_id")) != str(current_teacher["id"]):
+        raise HTTPException(status_code=403, detail="Access denied to this paper")
+
+    subject_info = await db.get_subject(str(paper.get("subject_id"))) if paper.get("subject_id") else None
+    raw_submissions = await db.get_submissions(paper_id)
+    candidate_class_ids = _report_candidate_class_ids(class_id_override, paper, subject_info, raw_submissions)
+
+    class_id = ""
+    class_info = None
+    for candidate in candidate_class_ids:
+        class_info = await db.get_class(candidate)
+        if class_info and str(class_info.get("teacher_id")) == str(current_teacher["id"]):
+            class_id = candidate
+            break
+
+    if not class_id or not class_info:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not determine the class for this paper. Select the class on the grading page, then export the report again.",
+        )
+
+    students = await db.get_students(class_id)
+    questions = _report_questions(paper)
+    student_map = {str(s.get("id")): s for s in students}
+    submissions = [
+        submission
+        for submission in raw_submissions
+        if _submission_belongs_to_report_class(submission, class_id, student_map)
+    ]
+
+    latest_by_student: Dict[str, Dict[str, Any]] = {}
+    unmatched_submissions: List[Dict[str, Any]] = []
+    duplicate_count = 0
+    for submission in submissions:
+        serialized = _serialize_submission(submission, paper)
+        sid = serialized.get("student_id")
+        if sid and sid in student_map:
+            if sid in latest_by_student:
+                duplicate_count += 1
+                continue
+            latest_by_student[sid] = serialized
+        else:
+            unmatched_submissions.append(serialized)
+
+    rows: List[Dict[str, Any]] = []
+    for student in students:
+        sid = str(student.get("id"))
+        rows.append(_build_report_student_row(student, latest_by_student.get(sid), questions))
+
+    for index, submission in enumerate(unmatched_submissions, start=1):
+        rows.append(_build_report_unmatched_row(submission, questions, index))
+
+    rows.sort(key=lambda row: (
+        1 if row.get("unmatched") else 0,
+        str(row.get("roll_number") or "").lower(),
+        str(row.get("student_name") or "").lower(),
+    ))
+
+    submitted_rows = [r for r in rows if r.get("submitted")]
+    graded_rows = [r for r in submitted_rows if str(r.get("status", "")).lower() in {"graded", "completed", "complete", "done"}]
+    score_rows = [r for r in submitted_rows if r.get("percentage") is not None]
+    percentages = [float(r["percentage"]) for r in score_rows]
+    total_marks = _to_float(paper.get("total_marks"), 0.0) or sum(q["max_marks"] for q in questions)
+    avg_pct = round(sum(percentages) / len(percentages), 2) if percentages else 0.0
+    pass_rows = [r for r in score_rows if float(r["percentage"]) >= 50]
+    grade_distribution: Dict[str, int] = {}
+    for row in score_rows:
+        grade = row.get("grade") or _grade_label(float(row.get("percentage") or 0))
+        grade_distribution[grade] = grade_distribution.get(grade, 0) + 1
+
+    question_analysis = _build_question_analysis(rows, questions)
+    summary = {
+        "roster_students": len(students),
+        "submitted_count": len(submitted_rows),
+        "graded_count": len(graded_rows),
+        "not_submitted_count": max(len(students) - len(latest_by_student), 0),
+        "unmatched_submission_count": len(unmatched_submissions),
+        "duplicate_submission_count": duplicate_count,
+        "average_percentage": avg_pct,
+        "highest_percentage": round(max(percentages), 2) if percentages else 0.0,
+        "lowest_percentage": round(min(percentages), 2) if percentages else 0.0,
+        "pass_rate": round((len(pass_rows) / len(score_rows)) * 100, 2) if score_rows else 0.0,
+        "total_marks": total_marks,
+        "grade_distribution": grade_distribution,
+    }
+
+    return {
+        "paper": {
+            "id": str(paper.get("id")),
+            "title": paper.get("title") or "Paper",
+            "total_marks": total_marks,
+            "created_at": str(paper.get("created_at") or ""),
+            "published_at": str(paper.get("published_at") or ""),
+        },
+        "class": {
+            "id": class_id,
+            "name": class_info.get("name") or "Class",
+            "grade_level": class_info.get("grade_level") or "",
+            "academic_year": class_info.get("academic_year") or "",
+        },
+        "subject": {
+            "id": str((subject_info or {}).get("id") or paper.get("subject_id") or ""),
+            "name": (subject_info or {}).get("name") or "Subject",
+        },
+        "teacher": {
+            "name": current_teacher.get("name") or current_teacher.get("full_name") or current_teacher.get("email") or "Teacher",
+            "email": current_teacher.get("email") or "",
+        },
+        "generated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        "questions": questions,
+        "rows": rows,
+        "question_analysis": question_analysis,
+        "summary": summary,
+    }
+
+
+def _report_questions(paper: dict) -> List[Dict[str, Any]]:
+    questions = _parse_jsonish(paper.get("questions"), [])
+    if not isinstance(questions, list):
+        questions = []
+    normalized = []
+    for index, question in enumerate(questions, start=1):
+        if not isinstance(question, dict):
+            continue
+        qid = str(_first_present(question.get("id"), question.get("question_id"), f"q{index}"))
+        max_marks = _to_float(_first_present(question.get("marks"), question.get("max_marks"), question.get("max_score")), 0.0) or 0.0
+        normalized.append({
+            "id": qid,
+            "label": f"Q{question.get('question_number') or index}",
+            "index": index,
+            "question_text": str(question.get("question_text") or question.get("text") or ""),
+            "question_type": str(question.get("question_type") or question.get("type") or "question").replace("_", " "),
+            "max_marks": max_marks,
+        })
+    return normalized
+
+
+def _report_candidate_class_ids(
+    class_id_override: Optional[str],
+    paper: dict,
+    subject_info: Optional[dict],
+    submissions: List[dict],
+) -> List[str]:
+    candidates: List[str] = []
+    for value in (
+        class_id_override,
+        paper.get("class_id"),
+        (subject_info or {}).get("class_id"),
+    ):
+        if value:
+            candidate = str(value)
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    submission_class_ids = []
+    for submission in submissions:
+        if submission.get("class_id"):
+            candidate = str(submission["class_id"])
+            if candidate not in submission_class_ids:
+                submission_class_ids.append(candidate)
+
+    if len(submission_class_ids) == 1 and submission_class_ids[0] not in candidates:
+        candidates.append(submission_class_ids[0])
+    elif class_id_override:
+        for candidate in submission_class_ids:
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    return candidates
+
+
+def _submission_belongs_to_report_class(submission: dict, class_id: str, student_map: Dict[str, dict]) -> bool:
+    if submission.get("class_id") and str(submission["class_id"]) == class_id:
+        return True
+    student_id = str(submission.get("student_id") or "")
+    if student_id and student_id in student_map:
+        return True
+    return not submission.get("class_id") and not student_id
+
+
+def _build_report_student_row(student: dict, submission: Optional[dict], questions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    row = {
+        "student_id": str(student.get("id") or ""),
+        "student_name": student.get("student_name") or student.get("name") or "Student",
+        "roll_number": student.get("student_id") or student.get("roll_number") or "",
+        "email": student.get("email") or "",
+        "submitted": bool(submission),
+        "status": "graded" if submission else "not_submitted",
+        "total_score": None,
+        "max_score": None,
+        "percentage": None,
+        "grade": "",
+        "submitted_at": "",
+        "graded_at": "",
+        "question_scores": _empty_question_scores(questions),
+        "unmatched": False,
+    }
+    if submission:
+        _merge_submission_into_report_row(row, submission, questions)
+    return row
+
+
+def _build_report_unmatched_row(submission: dict, questions: List[Dict[str, Any]], index: int) -> Dict[str, Any]:
+    row = {
+        "student_id": submission.get("student_id") or f"unmatched-{index}",
+        "student_name": submission.get("student_name") or f"Unmatched submission {index}",
+        "roll_number": "Unmatched",
+        "email": "",
+        "submitted": True,
+        "status": submission.get("status") or "graded",
+        "total_score": None,
+        "max_score": None,
+        "percentage": None,
+        "grade": "",
+        "submitted_at": submission.get("submitted_at") or "",
+        "graded_at": submission.get("graded_at") or "",
+        "question_scores": _empty_question_scores(questions),
+        "unmatched": True,
+    }
+    _merge_submission_into_report_row(row, submission, questions)
+    return row
+
+
+def _merge_submission_into_report_row(row: Dict[str, Any], submission: dict, questions: List[Dict[str, Any]]) -> None:
+    total_score = _to_float(_first_present(submission.get("total_score"), submission.get("score")), None)
+    max_score = _to_float(_first_present(submission.get("max_score"), submission.get("total_marks")), None)
+    pct = _to_float(submission.get("grade_percentage"), None)
+    if pct is None and total_score is not None and max_score:
+        pct = (total_score / max_score) * 100
+
+    row.update({
+        "submitted": True,
+        "status": submission.get("status") or "graded",
+        "total_score": total_score,
+        "max_score": max_score,
+        "percentage": round(pct, 2) if pct is not None else None,
+        "grade": submission.get("grade") or (_grade_label(pct or 0) if pct is not None else ""),
+        "submitted_at": submission.get("submitted_at") or "",
+        "graded_at": submission.get("graded_at") or "",
+        "question_scores": _question_scores_for_submission(submission, questions),
+    })
+
+
+def _empty_question_scores(questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "question_id": q["id"],
+            "label": q["label"],
+            "score": None,
+            "max_marks": q["max_marks"],
+            "attempted": False,
+            "is_correct": False,
+            "comment": "",
+        }
+        for q in questions
+    ]
+
+
+def _question_scores_for_submission(submission: dict, questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    details = submission.get("question_details") or submission.get("grading_details") or submission.get("question_scores") or []
+    if not isinstance(details, list):
+        details = []
+    detail_by_id = {
+        str(detail.get("question_id")): detail
+        for detail in details
+        if isinstance(detail, dict) and detail.get("question_id") is not None
+    }
+
+    scores = []
+    for index, question in enumerate(questions):
+        detail = detail_by_id.get(question["id"])
+        if detail is None and index < len(details) and isinstance(details[index], dict):
+            detail = details[index]
+        if not detail:
+            scores.append({
+                "question_id": question["id"],
+                "label": question["label"],
+                "score": None,
+                "max_marks": question["max_marks"],
+                "attempted": False,
+                "is_correct": False,
+                "comment": "",
+            })
+            continue
+        score = _to_float(_first_present(detail.get("marks_awarded"), detail.get("scored_marks"), detail.get("score")), None)
+        max_marks = _to_float(_first_present(detail.get("max_marks"), detail.get("max_score"), question.get("max_marks")), question["max_marks"]) or 0.0
+        answer = _first_present(detail.get("student_answer"), detail.get("student_answer_text"), "")
+        attempted = detail.get("attempted")
+        if attempted is None:
+            attempted = bool(answer) or (score is not None and score > 0)
+        scores.append({
+            "question_id": question["id"],
+            "label": question["label"],
+            "score": score,
+            "max_marks": max_marks,
+            "attempted": bool(attempted),
+            "is_correct": bool(detail.get("is_correct")) or (score is not None and max_marks > 0 and score >= max_marks),
+            "comment": _first_present(detail.get("ai_comment"), detail.get("ai_feedback"), detail.get("feedback"), ""),
+        })
+    return scores
+
+
+def _build_question_analysis(rows: List[Dict[str, Any]], questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    submitted_rows = [row for row in rows if row.get("submitted")]
+    analysis = []
+    for index, question in enumerate(questions):
+        scores = []
+        attempted_count = 0
+        for row in submitted_rows:
+            q_scores = row.get("question_scores") or []
+            if index >= len(q_scores):
+                continue
+            item = q_scores[index]
+            if item.get("attempted"):
+                attempted_count += 1
+            if item.get("score") is not None:
+                scores.append(float(item["score"]))
+        max_marks = question["max_marks"]
+        average = round(sum(scores) / len(scores), 2) if scores else 0.0
+        average_pct = round((average / max_marks) * 100, 2) if max_marks else 0.0
+        attempt_rate = round((attempted_count / len(submitted_rows)) * 100, 2) if submitted_rows else 0.0
+        analysis.append({
+            **question,
+            "average_score": average,
+            "average_percentage": average_pct,
+            "highest_score": round(max(scores), 2) if scores else 0.0,
+            "lowest_score": round(min(scores), 2) if scores else 0.0,
+            "attempt_rate": attempt_rate,
+            "needs_review": average_pct < 50 or attempt_rate < 70,
+        })
+    return analysis
+
+
+def _build_report_csv_response(report: Dict[str, Any]) -> StreamingResponse:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Class Result Report"])
+    writer.writerow(["Class", report["class"]["name"], "Subject", report["subject"]["name"], "Paper", report["paper"]["title"]])
+    writer.writerow(["Teacher", report["teacher"]["name"], "Generated", report["generated_at"], "Total Marks", _fmt_num(report["summary"]["total_marks"])])
+    writer.writerow([])
+    writer.writerow(["Summary"])
+    for key, value in report["summary"].items():
+        if key == "grade_distribution":
+            writer.writerow(["grade_distribution", "; ".join(f"{grade}: {count}" for grade, count in value.items())])
+        else:
+            writer.writerow([key, value])
+    writer.writerow([])
+
+    question_labels = [q["label"] for q in report["questions"]]
+    writer.writerow(["Roll No", "Student Name", "Email", "Status", "Total Score", "Max Score", "Percentage", "Grade", *question_labels])
+    for row in report["rows"]:
+        writer.writerow([
+            row.get("roll_number") or "",
+            row.get("student_name") or "",
+            row.get("email") or "",
+            _status_label(row.get("status")),
+            _fmt_num(row.get("total_score")),
+            _fmt_num(row.get("max_score")),
+            _fmt_pct(row.get("percentage")),
+            row.get("grade") or "",
+            *[_score_cell(item) for item in row.get("question_scores", [])],
+        ])
+
+    writer.writerow([])
+    writer.writerow(["Question Analysis"])
+    writer.writerow(["Question", "Type", "Max Marks", "Average", "Average %", "Highest", "Attempt Rate", "Review"])
+    for q in report["question_analysis"]:
+        writer.writerow([
+            q["label"],
+            q["question_type"],
+            _fmt_num(q["max_marks"]),
+            _fmt_num(q["average_score"]),
+            _fmt_pct(q["average_percentage"]),
+            _fmt_num(q["highest_score"]),
+            _fmt_pct(q["attempt_rate"]),
+            "Needs review" if q["needs_review"] else "OK",
+        ])
+
+    data = io.BytesIO(output.getvalue().encode("utf-8-sig"))
+    filename = _report_filename(report, "csv")
+    return StreamingResponse(
+        data,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _build_report_pdf_response(report: Dict[str, Any]) -> StreamingResponse:
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except Exception as exc:
+        logger.error(f"ReportLab is required for PDF report generation: {exc}")
+        raise HTTPException(status_code=500, detail="PDF report generation dependency is not available")
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        leftMargin=0.35 * inch,
+        rightMargin=0.35 * inch,
+        topMargin=0.35 * inch,
+        bottomMargin=0.45 * inch,
+        title=f"{report['paper']['title']} Class Report",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("ReportTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=18, leading=22, textColor=colors.HexColor("#0f172a"), alignment=TA_CENTER, spaceAfter=8)
+    section_style = ParagraphStyle("ReportSection", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=10, leading=12, textColor=colors.HexColor("#0A66C2"), spaceBefore=10, spaceAfter=6)
+    small_style = ParagraphStyle("ReportSmall", parent=styles["BodyText"], fontSize=7, leading=8, textColor=colors.HexColor("#0f172a"), alignment=TA_LEFT)
+    small_center = ParagraphStyle("ReportSmallCenter", parent=small_style, alignment=TA_CENTER)
+    small_right = ParagraphStyle("ReportSmallRight", parent=small_style, alignment=TA_RIGHT)
+    muted_style = ParagraphStyle("ReportMuted", parent=styles["BodyText"], fontSize=8, leading=10, textColor=colors.HexColor("#475569"), alignment=TA_CENTER)
+    story = []
+
+    story.append(Paragraph("Class Result Report", title_style))
+    story.append(Paragraph(_esc(f"{report['class']['name']} / {report['subject']['name']} / {report['paper']['title']}"), muted_style))
+    story.append(Spacer(1, 0.08 * inch))
+
+    meta_rows = [
+        ["Class", report["class"]["name"], "Subject", report["subject"]["name"]],
+        ["Paper", report["paper"]["title"], "Total Marks", _fmt_num(report["summary"]["total_marks"])],
+        ["Teacher", report["teacher"]["name"], "Generated", report["generated_at"]],
+    ]
+    meta_table = Table([[ _p(cell, small_style if i % 2 else small_center) for i, cell in enumerate(row)] for row in meta_rows], colWidths=[0.85 * inch, 3.7 * inch, 0.95 * inch, 3.7 * inch])
+    meta_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dbeafe")),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#eff6ff")),
+        ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#eff6ff")),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(meta_table)
+
+    summary = report["summary"]
+    summary_data = [
+        ["Roster", summary["roster_students"], "Submitted", summary["submitted_count"], "Not Submitted", summary["not_submitted_count"]],
+        ["Average", _fmt_pct(summary["average_percentage"]), "Highest", _fmt_pct(summary["highest_percentage"]), "Lowest", _fmt_pct(summary["lowest_percentage"])],
+        ["Pass Rate", _fmt_pct(summary["pass_rate"]), "Graded", summary["graded_count"], "Unmatched", summary["unmatched_submission_count"]],
+    ]
+    summary_table = Table([[ _p(cell, small_center) for cell in row] for row in summary_data], colWidths=[1.15 * inch] * 6)
+    summary_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#e2e8f0")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f8fafc")),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(Paragraph("Summary", section_style))
+    story.append(summary_table)
+
+    distribution = summary.get("grade_distribution") or {}
+    if distribution:
+        dist_text = "   ".join(f"{grade}: {count}" for grade, count in sorted(distribution.items()))
+        story.append(Paragraph(_esc(f"Grade distribution: {dist_text}"), muted_style))
+
+    story.append(Paragraph("Student Results", section_style))
+    story.extend(_build_pdf_result_tables(report, small_style, small_center, small_right, colors, inch, Table, TableStyle, Paragraph, PageBreak))
+
+    story.append(PageBreak())
+    story.append(Paragraph("Question Analysis", section_style))
+    analysis_rows = [["Question", "Type", "Max", "Average", "Average %", "Highest", "Attempted", "Review"]]
+    for q in report["question_analysis"]:
+        review = "Needs review" if q["needs_review"] else "OK"
+        analysis_rows.append([
+            _p(f"{q['label']}: {q['question_text'][:95]}", small_style),
+            _p(q["question_type"], small_center),
+            _p(_fmt_num(q["max_marks"]), small_center),
+            _p(_fmt_num(q["average_score"]), small_center),
+            _p(_fmt_pct(q["average_percentage"]), small_center),
+            _p(_fmt_num(q["highest_score"]), small_center),
+            _p(_fmt_pct(q["attempt_rate"]), small_center),
+            _p(review, small_center),
+        ])
+    if len(analysis_rows) == 1:
+        analysis_rows.append([_p("No question-level data available.", small_center), "", "", "", "", "", "", ""])
+    analysis_table = Table(analysis_rows, repeatRows=1, colWidths=[3.4 * inch, 1.0 * inch, 0.55 * inch, 0.75 * inch, 0.75 * inch, 0.65 * inch, 0.8 * inch, 1.0 * inch])
+    analysis_table.setStyle(_report_table_style(colors))
+    story.append(analysis_table)
+
+    difficult = [q for q in report["question_analysis"] if q["needs_review"]]
+    if difficult:
+        story.append(Paragraph("Review Focus", section_style))
+        focus = "; ".join(f"{q['label']} ({_fmt_pct(q['average_percentage'])} avg, {_fmt_pct(q['attempt_rate'])} attempted)" for q in difficult[:8])
+        story.append(Paragraph(_esc(focus), small_style))
+
+    def _footer(canvas, doc_obj):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.HexColor("#64748b"))
+        canvas.drawString(doc.leftMargin, 0.22 * inch, f"Generated {report['generated_at']}")
+        canvas.drawRightString(doc.pagesize[0] - doc.rightMargin, 0.22 * inch, f"Page {doc_obj.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+    buffer.seek(0)
+    filename = _report_filename(report, "pdf")
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _build_pdf_result_tables(report, small_style, small_center, small_right, colors, inch, Table, TableStyle, Paragraph, PageBreak):
+    questions = report["questions"]
+    rows = report["rows"]
+    if not questions:
+        questions = [{"label": "Result", "max_marks": report["summary"]["total_marks"], "id": "result", "question_text": "", "question_type": ""}]
+
+    chunks = [questions[i:i + 8] for i in range(0, len(questions), 8)]
+    flowables = []
+    for chunk_index, chunk in enumerate(chunks):
+        if chunk_index > 0:
+            flowables.append(PageBreak())
+            flowables.append(Paragraph(f"Student Results (continued: {chunk[0]['label']} - {chunk[-1]['label']})", small_style))
+        fixed_widths = [0.7 * inch, 1.65 * inch, 0.65 * inch, 0.55 * inch, 0.55 * inch, 0.75 * inch]
+        q_width = max(0.42 * inch, (10.0 * inch - sum(fixed_widths)) / max(len(chunk), 1))
+        table_rows = [["Roll", "Student", "Total", "%", "Grade", "Status", *[f"{q['label']}\n/{_fmt_num(q['max_marks'])}" for q in chunk]]]
+        for row in rows:
+            q_cells = []
+            for question in chunk:
+                q_item = next((item for item in row.get("question_scores", []) if item.get("question_id") == question["id"]), None)
+                q_cells.append(_p(_score_cell(q_item), small_center))
+            table_rows.append([
+                _p(row.get("roll_number") or "-", small_center),
+                _p(row.get("student_name") or "-", small_style),
+                _p(_fmt_num(row.get("total_score")), small_right),
+                _p(_fmt_pct(row.get("percentage")), small_center),
+                _p(row.get("grade") or "-", small_center),
+                _p(_status_label(row.get("status")), small_center),
+                *q_cells,
+            ])
+        table = Table(table_rows, repeatRows=1, colWidths=[*fixed_widths, *([q_width] * len(chunk))])
+        table.setStyle(_report_table_style(colors))
+        flowables.append(table)
+    return flowables
+
+
+def _build_report_email_pdf_file(report: Dict[str, Any], student_id: Optional[str] = None) -> tuple[bytes, str, str, Optional[Dict[str, Any]]]:
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except Exception as exc:
+        logger.error(f"ReportLab is required for PDF report email generation: {exc}")
+        raise HTTPException(status_code=500, detail="PDF report generation dependency is not available")
+
+    selected_row = None
+    email_report = dict(report)
+    if student_id:
+        for row in report.get("rows", []):
+            if str(row.get("student_id") or "") == str(student_id):
+                selected_row = row
+                break
+        if not selected_row:
+            raise HTTPException(status_code=404, detail="Student result was not found for this paper report")
+        email_report["rows"] = [selected_row]
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        leftMargin=0.35 * inch,
+        rightMargin=0.35 * inch,
+        topMargin=0.35 * inch,
+        bottomMargin=0.45 * inch,
+        title=f"{report['paper']['title']} Result Report",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("ReportEmailTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=18, leading=22, textColor=colors.HexColor("#0f172a"), alignment=TA_CENTER, spaceAfter=8)
+    section_style = ParagraphStyle("ReportEmailSection", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=10, leading=12, textColor=colors.HexColor("#0A66C2"), spaceBefore=10, spaceAfter=6)
+    small_style = ParagraphStyle("ReportEmailSmall", parent=styles["BodyText"], fontSize=7, leading=8, textColor=colors.HexColor("#0f172a"), alignment=TA_LEFT)
+    small_center = ParagraphStyle("ReportEmailSmallCenter", parent=small_style, alignment=TA_CENTER)
+    small_right = ParagraphStyle("ReportEmailSmallRight", parent=small_style, alignment=TA_RIGHT)
+    muted_style = ParagraphStyle("ReportEmailMuted", parent=styles["BodyText"], fontSize=8, leading=10, textColor=colors.HexColor("#475569"), alignment=TA_CENTER)
+
+    report_title = "Student Result Report" if selected_row else "Class Result Report"
+    story = [
+        Paragraph(report_title, title_style),
+        Paragraph(_esc(f"{report['class']['name']} / {report['subject']['name']} / {report['paper']['title']}"), muted_style),
+        Spacer(1, 0.08 * inch),
+    ]
+    if selected_row:
+        story.append(Paragraph(_esc(f"{selected_row.get('student_name')} - Roll No: {selected_row.get('roll_number') or '-'}"), muted_style))
+        story.append(Spacer(1, 0.05 * inch))
+
+    meta_rows = [
+        ["Class", report["class"]["name"], "Subject", report["subject"]["name"]],
+        ["Paper", report["paper"]["title"], "Total Marks", _fmt_num(report["summary"]["total_marks"])],
+        ["Teacher", report["teacher"]["name"], "Generated", report["generated_at"]],
+    ]
+    meta_table = Table([[_p(cell, small_style if i % 2 else small_center) for i, cell in enumerate(row)] for row in meta_rows], colWidths=[0.85 * inch, 3.7 * inch, 0.95 * inch, 3.7 * inch])
+    meta_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dbeafe")),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#eff6ff")),
+        ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#eff6ff")),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    story.append(meta_table)
+
+    summary = report["summary"]
+    summary_rows = [
+        ["Roster", summary["roster_students"], "Submitted", summary["submitted_count"], "Not Submitted", summary["not_submitted_count"]],
+        ["Average", _fmt_pct(summary["average_percentage"]), "Highest", _fmt_pct(summary["highest_percentage"]), "Lowest", _fmt_pct(summary["lowest_percentage"])],
+        ["Pass Rate", _fmt_pct(summary["pass_rate"]), "Graded", summary["graded_count"], "Unmatched", summary["unmatched_submission_count"]],
+    ]
+    summary_table = Table([[_p(cell, small_center) for cell in row] for row in summary_rows], colWidths=[1.15 * inch] * 6)
+    summary_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#e2e8f0")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f8fafc")),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(Paragraph("Summary", section_style))
+    story.append(summary_table)
+
+    story.append(Paragraph("Result Details", section_style))
+    story.extend(_build_pdf_result_tables(email_report, small_style, small_center, small_right, colors, inch, Table, TableStyle, Paragraph, PageBreak))
+
+    if not selected_row:
+        story.append(PageBreak())
+        story.append(Paragraph("Question Analysis", section_style))
+        analysis_rows = [["Question", "Type", "Max", "Average", "Average %", "Highest", "Attempted", "Review"]]
+        for q in report["question_analysis"]:
+            analysis_rows.append([
+                _p(f"{q['label']}: {q['question_text'][:95]}", small_style),
+                _p(q["question_type"], small_center),
+                _p(_fmt_num(q["max_marks"]), small_center),
+                _p(_fmt_num(q["average_score"]), small_center),
+                _p(_fmt_pct(q["average_percentage"]), small_center),
+                _p(_fmt_num(q["highest_score"]), small_center),
+                _p(_fmt_pct(q["attempt_rate"]), small_center),
+                _p("Needs review" if q["needs_review"] else "OK", small_center),
+            ])
+        if len(analysis_rows) == 1:
+            analysis_rows.append([_p("No question-level data available.", small_center), "", "", "", "", "", "", ""])
+        analysis_table = Table(analysis_rows, repeatRows=1, colWidths=[3.4 * inch, 1.0 * inch, 0.55 * inch, 0.75 * inch, 0.75 * inch, 0.65 * inch, 0.8 * inch, 1.0 * inch])
+        analysis_table.setStyle(_report_table_style(colors))
+        story.append(analysis_table)
+
+    def _footer(canvas, doc_obj):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.HexColor("#64748b"))
+        canvas.drawString(doc.leftMargin, 0.22 * inch, f"Generated {report['generated_at']}")
+        canvas.drawRightString(doc.pagesize[0] - doc.rightMargin, 0.22 * inch, f"Page {doc_obj.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+    if selected_row:
+        stem = f"{selected_row.get('student_name')}_{report['paper']['title']}_result_report"
+        filename = f"{re.sub(r'[^A-Za-z0-9._-]+', '_', stem).strip('._-')[:120] or 'student_result_report'}.pdf"
+    else:
+        filename = _report_filename(report, "pdf")
+    return buffer.getvalue(), filename, "application/pdf", selected_row
+
+
+def _report_table_style(colors):
+    from reportlab.platypus import TableStyle
+    return TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#dbeafe")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0A66C2")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ])
+
+
+def _p(value: Any, style):
+    from reportlab.platypus import Paragraph
+    return Paragraph(_esc(value), style)
+
+
+def _esc(value: Any) -> str:
+    return escape(str(value if value is not None and value != "" else "-"))
+
+
+def _fmt_num(value: Any) -> str:
+    number = _to_float(value, None)
+    if number is None:
+        return "-"
+    if abs(number - round(number)) < 0.005:
+        return str(int(round(number)))
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
+def _fmt_pct(value: Any) -> str:
+    number = _to_float(value, None)
+    if number is None:
+        return "-"
+    return f"{_fmt_num(number)}%"
+
+
+def _score_cell(item: Optional[dict]) -> str:
+    if not item or item.get("score") is None:
+        return "-"
+    return f"{_fmt_num(item.get('score'))}/{_fmt_num(item.get('max_marks'))}"
+
+
+def _status_label(status: Any) -> str:
+    value = str(status or "").replace("_", " ").strip()
+    if not value:
+        return "-"
+    return value[:1].upper() + value[1:]
+
+
+def _report_filename(report: Dict[str, Any], ext: str) -> str:
+    stem = f"{report['class']['name']}_{report['subject']['name']}_{report['paper']['title']}_report"
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-") or "class_report"
+    return f"{stem[:120]}.{ext}"
 

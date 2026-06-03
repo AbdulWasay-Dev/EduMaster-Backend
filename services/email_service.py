@@ -6,11 +6,15 @@ Students email their assignments to the teacher; the system parses and creates s
 import imaplib
 import email
 import os
+import smtplib
+import ssl
 import uuid
 import logging
 import json
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from email.header import decode_header
+from email.utils import formataddr
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -181,5 +185,91 @@ class EmailFetcher:
             return {"success": True, "message": "Connection successful"}
         except imaplib.IMAP4.error as e:
             return {"success": False, "message": f"Authentication failed: {e}"}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+
+class EmailSender:
+    """SMTP email sender for teacher report delivery."""
+
+    def __init__(
+        self,
+        email_address: str,
+        app_password: str,
+        smtp_host: str = "smtp.gmail.com",
+        smtp_port: int = 587,
+        smtp_use_tls: bool = True,
+        smtp_use_ssl: bool = False,
+        from_name: Optional[str] = None,
+    ):
+        self.email_address = email_address
+        self.app_password = app_password
+        self.smtp_host = smtp_host or "smtp.gmail.com"
+        self.smtp_port = int(smtp_port or 587)
+        self.smtp_use_tls = smtp_use_tls
+        self.smtp_use_ssl = smtp_use_ssl or self.smtp_port == 465
+        self.from_name = from_name or "EduMaster"
+
+    def _connect(self):
+        context = ssl.create_default_context()
+        if self.smtp_use_ssl:
+            server = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, context=context, timeout=30)
+        else:
+            server = smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30)
+            if self.smtp_use_tls:
+                server.starttls(context=context)
+        server.login(self.email_address, self.app_password)
+        return server
+
+    def send_email(
+        self,
+        to_email: str,
+        subject: str,
+        body: str,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Send an email with optional byte attachments."""
+        try:
+            msg = EmailMessage()
+            msg["From"] = formataddr((self.from_name, self.email_address))
+            msg["To"] = to_email
+            msg["Subject"] = subject
+            msg.set_content(body)
+
+            for attachment in attachments or []:
+                content = attachment.get("content") or b""
+                if isinstance(content, str):
+                    content = content.encode("utf-8")
+                filename = attachment.get("filename") or "report.pdf"
+                media_type = attachment.get("media_type") or "application/octet-stream"
+                maintype, _, subtype = media_type.partition("/")
+                msg.add_attachment(
+                    content,
+                    maintype=maintype or "application",
+                    subtype=subtype or "octet-stream",
+                    filename=filename,
+                )
+
+            server = self._connect()
+            try:
+                server.send_message(msg)
+            finally:
+                server.quit()
+            return {"success": True, "message": "Email sent successfully"}
+        except smtplib.SMTPAuthenticationError as e:
+            logger.error(f"SMTP authentication failed: {e}")
+            return {"success": False, "message": "SMTP authentication failed. Check the email address and app password."}
+        except Exception as e:
+            logger.error(f"SMTP send failed: {e}")
+            return {"success": False, "message": str(e)}
+
+    def test_connection(self) -> Dict[str, Any]:
+        """Test SMTP login without sending an email."""
+        try:
+            server = self._connect()
+            server.quit()
+            return {"success": True, "message": "SMTP connection successful"}
+        except smtplib.SMTPAuthenticationError as e:
+            return {"success": False, "message": f"SMTP authentication failed: {e}"}
         except Exception as e:
             return {"success": False, "message": str(e)}

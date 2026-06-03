@@ -93,6 +93,12 @@ class PaperResponse(BaseModel):
     student_fields: Optional[List[str]] = None
 
 
+class GradingReportSendRequest(BaseModel):
+    class_id: Optional[str] = None
+    student_id: Optional[str] = None
+    recipient_email: Optional[str] = None
+
+
 def _parse_string_list(value: Any, fallback: Optional[List[str]] = None) -> List[str]:
     fallback = fallback or ["name", "roll_number"]
     if isinstance(value, list):
@@ -1135,6 +1141,102 @@ async def download_answer_key(
             status_code=500, 
             detail=f"Failed to generate answer key: {str(e)}"
         )
+
+
+@router.get("/{paper_id}/grading-report")
+async def export_paper_grading_report(
+    paper_id: str,
+    format: str = Query("pdf", pattern="^(pdf|csv)$"),
+    class_id: Optional[str] = Query(None),
+    current_teacher: dict = Depends(require_teacher_or_admin())
+):
+    """Download the class grading report for this selected paper."""
+    try:
+        from routers.grading import (
+            _build_paper_class_report_data,
+            _build_report_csv_response,
+            _build_report_pdf_response,
+        )
+
+        db = await get_database()
+        report = await _build_paper_class_report_data(db, paper_id, current_teacher, class_id_override=class_id)
+        if format.lower() == "csv":
+            return _build_report_csv_response(report)
+        return _build_report_pdf_response(report)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error exporting grading report for paper {paper_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error while generating report")
+
+
+@router.post("/{paper_id}/grading-report/send")
+async def send_paper_grading_report(
+    paper_id: str,
+    request: GradingReportSendRequest,
+    current_teacher: dict = Depends(require_teacher_or_admin())
+):
+    """Send the selected paper grading report by SMTP."""
+    try:
+        from services.email_service import EmailSender
+        from routers.grading import _build_paper_class_report_data, _build_report_email_pdf_file, _fmt_pct
+
+        db = await get_database()
+        report = await _build_paper_class_report_data(db, paper_id, current_teacher, class_id_override=request.class_id)
+        content, filename, media_type, selected_row = _build_report_email_pdf_file(report, student_id=request.student_id)
+
+        recipient = (request.recipient_email or "").strip()
+        if selected_row and not recipient:
+            recipient = (selected_row.get("email") or "").strip()
+        if not recipient:
+            raise HTTPException(status_code=400, detail="Enter a recipient email address, or select a student with an email in the class roster")
+
+        email_config = await db.get_email_config(current_teacher["id"])
+        if not email_config or not email_config.get("is_active"):
+            raise HTTPException(status_code=400, detail="Configure and enable teacher email SMTP settings before sending reports")
+
+        sender = EmailSender(
+            email_config["email_address"],
+            email_config["app_password"],
+            email_config.get("smtp_host") or "smtp.gmail.com",
+            email_config.get("smtp_port") or 587,
+            email_config.get("smtp_use_tls", True),
+            email_config.get("smtp_use_ssl", False),
+            email_config.get("from_name") or "EduMaster Reports",
+        )
+        if selected_row:
+            subject = f"Result Report - {selected_row.get('student_name')} - {report['paper']['title']}"
+            body = (
+                f"Attached is the result report for {selected_row.get('student_name')} "
+                f"for {report['paper']['title']} ({report['class']['name']} / {report['subject']['name']}).\n\n"
+                f"Score: {selected_row.get('total_score') or '-'} / {selected_row.get('max_score') or '-'}\n"
+                f"Percentage: {_fmt_pct(selected_row.get('percentage'))}\n"
+                f"Grade: {selected_row.get('grade') or '-'}\n"
+            )
+        else:
+            subject = f"Class Result Report - {report['paper']['title']} - {report['class']['name']}"
+            body = (
+                f"Attached is the class result report for {report['class']['name']} / {report['subject']['name']} "
+                f"for the selected paper: {report['paper']['title']}.\n\n"
+                f"Submitted: {report['summary']['submitted_count']}\n"
+                f"Average: {_fmt_pct(report['summary']['average_percentage'])}\n"
+                f"Pass rate: {_fmt_pct(report['summary']['pass_rate'])}\n"
+            )
+
+        result = sender.send_email(
+            recipient,
+            subject,
+            body,
+            [{"filename": filename, "content": content, "media_type": media_type}],
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("message") or "Report email could not be sent")
+        return {"status": "success", "message": f"Grading report sent to {recipient}"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error sending grading report for paper {paper_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error while sending report")
 
 
 def _generate_printable_content(paper: dict) -> str:

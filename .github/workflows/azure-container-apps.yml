@@ -156,6 +156,44 @@ jobs:
             --max-replicas 1 \
             --output none
 
+      - name: Inspect Container Apps revision
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Container App configuration:"
+          az containerapp show \
+            --name "$AZURE_CONTAINER_APP" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "{fqdn:properties.configuration.ingress.fqdn,targetPort:properties.configuration.ingress.targetPort,latestRevision:properties.latestRevisionName,provisioningState:properties.provisioningState,scale:properties.template.scale,image:properties.template.containers[0].image}" \
+            --output json
+
+          echo "Revision status:"
+          az containerapp revision list \
+            --name "$AZURE_CONTAINER_APP" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --output table || true
+
+          LATEST_REVISION="$(az containerapp show \
+            --name "$AZURE_CONTAINER_APP" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.latestRevisionName \
+            --output tsv)"
+
+          echo "Latest revision: ${LATEST_REVISION}"
+          echo "Replica status:"
+          az containerapp replica list \
+            --name "$AZURE_CONTAINER_APP" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --revision "$LATEST_REVISION" \
+            --output table || true
+
+          echo "Startup logs:"
+          az containerapp logs show \
+            --name "$AZURE_CONTAINER_APP" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --tail 120 || true
+
       - name: Smoke test health endpoint
         shell: bash
         run: |
