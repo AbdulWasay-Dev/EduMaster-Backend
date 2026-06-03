@@ -25,8 +25,8 @@ $jwtSecret = Read-Host "Backend SECRET_KEY" -AsSecureString
 
 .\infra\azure\provision-backend.ps1 `
   -SubscriptionId "<your-subscription-id>" `
-  -Location "eastus" `
-  -ResourceGroup "rg-edumaster-prod" `
+  -Location "southeastasia" `
+  -ResourceGroup "rg-edumaster-prod-sea" `
   -NamePrefix "edumaster" `
   -PostgresAdminPassword $pgPassword `
   -SecretKey $jwtSecret `
