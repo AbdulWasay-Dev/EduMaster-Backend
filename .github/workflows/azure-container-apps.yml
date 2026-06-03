@@ -157,6 +157,8 @@ jobs:
       - name: Smoke test health endpoint
         shell: bash
         run: |
+          set -euo pipefail
+
           FQDN="$(az containerapp show \
             --name "$AZURE_CONTAINER_APP" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -166,15 +168,43 @@ jobs:
           URL="https://${FQDN}/health"
           echo "Checking ${URL}"
 
-          for attempt in {1..24}; do
+          for attempt in {1..60}; do
             if curl --fail --silent --show-error "$URL"; then
               echo
               echo "Health check passed."
               exit 0
             fi
-            echo "Waiting for the new revision... attempt ${attempt}/24"
-            sleep 10
+
+            echo "Waiting for the new revision... attempt ${attempt}/60"
+
+            if [ $((attempt % 5)) -eq 0 ]; then
+              echo "Revision status:"
+              az containerapp revision list \
+                --name "$AZURE_CONTAINER_APP" \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --output table || true
+
+              echo "Recent app logs:"
+              az containerapp logs show \
+                --name "$AZURE_CONTAINER_APP" \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --tail 80 || true
+            fi
+
+            sleep 20
           done
 
           echo "Health check failed after waiting for the new revision."
+          echo "Final revision status:"
+          az containerapp revision list \
+            --name "$AZURE_CONTAINER_APP" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --output table || true
+
+          echo "Final app logs:"
+          az containerapp logs show \
+            --name "$AZURE_CONTAINER_APP" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --tail 200 || true
+
           exit 1

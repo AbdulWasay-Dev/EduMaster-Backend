@@ -55,7 +55,9 @@ COPY requirements.txt .
 
 RUN set -eux; \
     pip install --upgrade pip setuptools wheel; \
-    pip install --no-cache-dir -r requirements.txt; \
+    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torch==2.10.0"; \
+    grep -v '^torch==' requirements.txt > /tmp/requirements-ci.txt; \
+    pip install --no-cache-dir -r /tmp/requirements-ci.txt; \
     apt-get purge -y --auto-remove build-essential gcc g++ git libpq-dev libffi-dev libssl-dev; \
     rm -rf /root/.cache/pip /tmp/* /var/tmp/*
 

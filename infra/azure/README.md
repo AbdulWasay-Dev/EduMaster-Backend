@@ -92,7 +92,7 @@ Push to `main`. The workflow at `.github/workflows/azure-container-apps.yml` wil
 
 1. Compile the Python app modules.
 2. Free disk space on the GitHub runner.
-3. Build `Dockerfile.ci`, a smaller-build-footprint image with OCR, ChromaDB, and local embedding dependencies.
+3. Build `Dockerfile.ci`, a smaller-build-footprint image with OCR, ChromaDB, CPU-only PyTorch, and local embedding dependencies.
 4. Push tags `latest` and the commit SHA to Azure Container Registry.
 5. Update the Azure Container App to the commit SHA image.
 6. Smoke-test `https://<container-app-fqdn>/health`.
@@ -102,6 +102,7 @@ Push to `main`. The workflow at `.github/workflows/azure-container-apps.yml` wil
 - Redis/Celery are not provisioned here because the current backend only defines Redis/Celery settings; no Python module currently imports or uses Redis/Celery. Add Azure Cache for Redis when background workers are actually introduced.
 - Azure Files is acceptable for this app while `MaxReplicas=1`. ChromaDB uses local files, so do not scale this container horizontally without changing vector storage.
 - Azure for Students may block ACR Tasks, so the workflow intentionally does not use `az acr build`.
+- `Dockerfile.ci` uses CPU-only PyTorch to avoid pushing large CUDA layers to Azure Container Apps.
 - PostgreSQL uses `?sslmode=require` in `DATABASE_URL`.
 - To update frontend access later:
 
