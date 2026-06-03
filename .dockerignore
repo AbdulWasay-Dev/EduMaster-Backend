@@ -66,5 +66,6 @@ docs/
 
 # ── Docker files themselves (no need to copy into the image) ──────────────────
 Dockerfile
+Dockerfile.ci
 docker-compose.yml
 .dockerignore

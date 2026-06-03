@@ -8,7 +8,7 @@ This backend is designed to run on Azure Container Apps with:
 - ChromaDB persisted on an Azure Files mount at `/app/chroma_db`
 - Uploaded files persisted on an Azure Files mount at `/app/uploads`
 - HuggingFace/Torch caches persisted on Azure Files so cold starts do less work
-- GitHub Actions triggering an Azure Container Registry build, then updating Container Apps
+- GitHub Actions building a CI-friendly Docker image, pushing it to Azure Container Registry, then updating Container Apps
 
 The default replica range is `0..1` to save Azure for Students credit and to avoid multiple replicas writing to the same local ChromaDB files. If you later move vector search to a network service, you can raise `MaxReplicas`.
 
@@ -52,7 +52,7 @@ Replace `OWNER/REPO` with your backend GitHub repository, then run:
 
 ```powershell
 $repo = "OWNER/REPO"
-$resourceGroup = "rg-edumaster-prod"
+$resourceGroup = "rg-edumaster-prod-sea"
 $acrName = "<AZURE_CONTAINER_REGISTRY from the provision script>"
 $appName = "edumaster-backend-github"
 
@@ -91,15 +91,17 @@ AZURE_SUBSCRIPTION_ID=<subscriptionId>
 Push to `main`. The workflow at `.github/workflows/azure-container-apps.yml` will:
 
 1. Compile the Python app modules.
-2. Ask Azure Container Registry to build the Docker image with OCR, ChromaDB, and local embedding dependencies.
-3. Push tags `latest` and the commit SHA inside Azure Container Registry.
-4. Update the Azure Container App to the commit SHA image.
-5. Smoke-test `https://<container-app-fqdn>/health`.
+2. Free disk space on the GitHub runner.
+3. Build `Dockerfile.ci`, a smaller-build-footprint image with OCR, ChromaDB, and local embedding dependencies.
+4. Push tags `latest` and the commit SHA to Azure Container Registry.
+5. Update the Azure Container App to the commit SHA image.
+6. Smoke-test `https://<container-app-fqdn>/health`.
 
 ## Notes
 
 - Redis/Celery are not provisioned here because the current backend only defines Redis/Celery settings; no Python module currently imports or uses Redis/Celery. Add Azure Cache for Redis when background workers are actually introduced.
 - Azure Files is acceptable for this app while `MaxReplicas=1`. ChromaDB uses local files, so do not scale this container horizontally without changing vector storage.
+- Azure for Students may block ACR Tasks, so the workflow intentionally does not use `az acr build`.
 - PostgreSQL uses `?sslmode=require` in `DATABASE_URL`.
 - To update frontend access later:
 
