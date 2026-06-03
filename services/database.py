@@ -250,6 +250,9 @@ class DatabaseService:
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
 
+    ALTER TABLE assignments ADD COLUMN IF NOT EXISTS attachment_url TEXT;
+    ALTER TABLE assignments ADD COLUMN IF NOT EXISTS attachment_filename TEXT;
+
     CREATE TABLE IF NOT EXISTS assignment_submissions (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         assignment_id UUID REFERENCES assignments(id) ON DELETE CASCADE NOT NULL,
@@ -2593,10 +2596,16 @@ class DatabaseService:
                 SELECT
                     l.*,
                     a.title AS assignment_title,
+                    a.class_id,
+                    a.subject_id,
+                    c.name AS class_name,
+                    subj.name AS subject_name,
                     sa.full_name AS student_name,
                     sa.email AS student_email
                 FROM email_submission_logs l
                 LEFT JOIN assignments a ON a.id = l.assignment_id
+                LEFT JOIN classes c ON c.id = a.class_id
+                LEFT JOIN subjects subj ON subj.id = a.subject_id
                 LEFT JOIN student_accounts sa ON sa.id = l.student_account_id
                 WHERE l.teacher_id = $1
             """

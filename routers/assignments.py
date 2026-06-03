@@ -3,9 +3,9 @@ Assignments API — CRUD + publish/close + AI generation + submissions + grading
 + Email integration (IMAP) + Manual upload
 NOTE: Static routes (email/*, generate-content) MUST come before /{assignment_id}
 """
-import logging, os, uuid, json
+import logging, os, uuid, json, re
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from utils.security import require_teacher
@@ -28,6 +28,10 @@ class AssignmentCreate(BaseModel):
     grading_rubric: Optional[str] = None
     auto_grade: bool = True
     status: str = "draft"
+    attachment_url: Optional[str] = None
+    attachment_filename: Optional[str] = None
+    generate_pdf: bool = True
+    generated_outline: Optional[Dict[str, Any]] = None
 
 class AssignmentUpdate(BaseModel):
     title: Optional[str] = None
@@ -56,13 +60,29 @@ class GenerateContentRequest(BaseModel):
     class_name: Optional[str] = None
     total_marks: int = 10
     topic_hint: Optional[str] = None
+    assignment_type: str = "worksheet"
+    difficulty_level: str = "medium"
+    estimated_duration: Optional[str] = None
+    deliverables: Optional[List[str]] = None
+    requirements: Optional[str] = None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
+def _assignment_email_code(assignment_id: str) -> str:
+    clean = re.sub(r"[^a-fA-F0-9]", "", assignment_id or "")
+    suffix = (clean[:8] or uuid.uuid4().hex[:8]).upper()
+    return f"ASG-{suffix}"
+
+
+def _assignment_email_subject(title: str, assignment_id: str) -> str:
+    return f"[{_assignment_email_code(assignment_id)}] {title}".strip()
+
+
 def _ser(a: dict) -> dict:
+    assignment_id = str(a["id"])
     return {
-        "id": str(a["id"]),
+        "id": assignment_id,
         "teacher_id": str(a["teacher_id"]),
         "subject_id": str(a["subject_id"]),
         "subject_name": a.get("subject_name"),
@@ -75,6 +95,8 @@ def _ser(a: dict) -> dict:
         "due_date": str(a["due_date"]) if a.get("due_date") else None,
         "attachment_url": a.get("attachment_url"),
         "attachment_filename": a.get("attachment_filename"),
+        "email_submission_code": _assignment_email_code(assignment_id),
+        "email_subject_syntax": _assignment_email_subject(a.get("title", ""), assignment_id),
         "grading_rubric": a.get("grading_rubric"),
         "auto_grade": a.get("auto_grade", True),
         "status": a.get("status", "draft"),
@@ -132,6 +154,11 @@ def _ser_email_log(log: dict) -> dict:
         "id": str(log["id"]),
         "assignment_id": str(log["assignment_id"]) if log.get("assignment_id") else None,
         "assignment_title": log.get("assignment_title"),
+        "assignment_code": _assignment_email_code(str(log["assignment_id"])) if log.get("assignment_id") else None,
+        "class_id": str(log["class_id"]) if log.get("class_id") else None,
+        "class_name": log.get("class_name"),
+        "subject_id": str(log["subject_id"]) if log.get("subject_id") else None,
+        "subject_name": log.get("subject_name"),
         "student_account_id": str(log["student_account_id"]) if log.get("student_account_id") else None,
         "student_name": log.get("student_name"),
         "student_email": log.get("student_email"),
@@ -151,6 +178,260 @@ def _parse_due(v):
         return datetime.fromisoformat(v.replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def _safe_filename(value: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "_", value or "assignment").strip("._-")
+    return clean[:80] or "assignment"
+
+
+def _as_text_list(value: Any) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        items: List[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("title") or item.get("details") or item.get("description") or ""
+            else:
+                text = str(item)
+            text = text.strip()
+            if text:
+                items.append(text)
+        return items
+    if isinstance(value, str):
+        return [line.strip(" -\t") for line in value.splitlines() if line.strip(" -\t")]
+    return [str(value)]
+
+
+def _normalize_generated_payload(data: dict, req: GenerateContentRequest) -> dict:
+    raw_tasks = data.get("tasks") or []
+    if not isinstance(raw_tasks, list):
+        raw_tasks = []
+
+    tasks = []
+    for idx, item in enumerate(raw_tasks[:8], start=1):
+        if isinstance(item, dict):
+            title = str(item.get("title") or f"Task {idx}").strip()
+            details = str(item.get("details") or item.get("description") or "").strip()
+            marks = item.get("marks")
+        else:
+            title = f"Task {idx}"
+            details = str(item).strip()
+            marks = None
+        tasks.append({"title": title or f"Task {idx}", "details": details, "marks": marks})
+
+    deliverables = _as_text_list(data.get("deliverables")) or _as_text_list(req.deliverables)
+    objectives = _as_text_list(data.get("learning_objectives") or data.get("objectives"))
+    instructions = str(data.get("instructions") or "").strip()
+    if not instructions and tasks:
+        instructions = "\n".join(
+            f"{i}. {task['title']}: {task['details']}" for i, task in enumerate(tasks, start=1)
+        )
+
+    return {
+        "assignment_name": str(data.get("assignment_name") or req.title).strip(),
+        "description": str(data.get("description") or "").strip(),
+        "instructions": instructions,
+        "grading_rubric": str(data.get("grading_rubric") or data.get("rubric") or "").strip(),
+        "learning_objectives": objectives,
+        "tasks": tasks,
+        "deliverables": deliverables,
+        "submission_format": str(
+            data.get("submission_format") or "Submit one PDF or document file with your completed work."
+        ).strip(),
+        "email_subject_syntax": str(data.get("email_subject_syntax") or f"[ASG-CODE] {req.title}").strip(),
+        "assignment_type": req.assignment_type,
+        "difficulty_level": req.difficulty_level,
+        "estimated_duration": req.estimated_duration,
+    }
+
+
+def _build_assignment_pdf(
+    assignment: dict,
+    *,
+    class_name: str = "",
+    subject_name: str = "",
+    teacher_name: str = "",
+    outline: Optional[Dict[str, Any]] = None,
+) -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from xml.sax.saxutils import escape
+    import io
+
+    outline = outline or {}
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=0.72 * inch,
+        leftMargin=0.72 * inch,
+        topMargin=0.72 * inch,
+        bottomMargin=0.72 * inch,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "AssignmentTitle",
+        parent=styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=18,
+        leading=22,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#0f172a"),
+    )
+    section_style = ParagraphStyle(
+        "AssignmentSection",
+        parent=styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=12,
+        leading=15,
+        spaceBefore=10,
+        spaceAfter=6,
+        textColor=colors.HexColor("#0A66C2"),
+    )
+    body_style = ParagraphStyle(
+        "AssignmentBody",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=9.5,
+        leading=13,
+        textColor=colors.HexColor("#1f2937"),
+    )
+
+    assignment_id = str(assignment["id"])
+    title = assignment.get("title") or "Assignment"
+    code = _assignment_email_code(assignment_id)
+    due_date = assignment.get("due_date")
+    due_text = due_date.strftime("%b %d, %Y %I:%M %p") if hasattr(due_date, "strftime") else (str(due_date) if due_date else "No deadline")
+
+    def p(text: Any, style=body_style):
+        escaped = escape(str(text or "")).replace("\n", "<br/>")
+        return Paragraph(escaped, style)
+
+    story = [
+        Paragraph(
+            "ASSIGNMENT SHEET",
+            ParagraphStyle(
+                "AssignmentKicker",
+                parent=styles["Normal"],
+                fontName="Helvetica-Bold",
+                fontSize=10,
+                alignment=TA_CENTER,
+                textColor=colors.HexColor("#0A66C2"),
+                spaceAfter=5,
+            ),
+        ),
+        Paragraph(escape(title), title_style),
+        Spacer(1, 12),
+    ]
+
+    info_rows = [
+        [p("Class"), p(class_name or assignment.get("class_name") or "Class not set"), p("Subject"), p(subject_name or assignment.get("subject_name") or "Subject not set")],
+        [p("Total Marks"), p(assignment.get("total_marks", 10)), p("Deadline"), p(due_text)],
+        [p("Assignment Code"), p(code), p("Teacher"), p(teacher_name or "Teacher")],
+        [p("Email Subject"), p(_assignment_email_subject(title, assignment_id)), "", ""],
+    ]
+    info_table = Table(info_rows, colWidths=[1.15 * inch, 2.05 * inch, 1.15 * inch, 2.05 * inch])
+    info_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+        ("SPAN", (1, 3), (3, 3)),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.extend([info_table, Spacer(1, 10)])
+
+    description = assignment.get("description") or outline.get("description")
+    if description:
+        story.extend([Paragraph("Overview", section_style), p(description)])
+
+    objectives = _as_text_list(outline.get("learning_objectives") or outline.get("objectives"))
+    if objectives:
+        story.append(Paragraph("Learning Objectives", section_style))
+        for item in objectives:
+            story.append(p(f"- {item}"))
+
+    tasks = outline.get("tasks") if isinstance(outline.get("tasks"), list) else []
+    if tasks:
+        story.append(Paragraph("Assignment Tasks", section_style))
+        rows = [[p("#"), p("Task"), p("Requirements"), p("Marks")]]
+        for idx, task in enumerate(tasks, start=1):
+            if isinstance(task, dict):
+                task_title = task.get("title") or f"Task {idx}"
+                details = task.get("details") or task.get("description") or ""
+                marks = task.get("marks") or ""
+            else:
+                task_title = f"Task {idx}"
+                details = str(task)
+                marks = ""
+            rows.append([p(idx), p(task_title), p(details), p(marks)])
+        task_table = Table(rows, colWidths=[0.35 * inch, 1.5 * inch, 3.65 * inch, 0.7 * inch], repeatRows=1)
+        task_table.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#cbd5e1")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf3fc")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.append(task_table)
+
+    instructions = assignment.get("instructions") or outline.get("instructions")
+    if instructions:
+        story.extend([Paragraph("Instructions", section_style), p(instructions)])
+
+    deliverables = _as_text_list(outline.get("deliverables"))
+    if deliverables:
+        story.append(Paragraph("Deliverables", section_style))
+        for item in deliverables:
+            story.append(p(f"- {item}"))
+
+    rubric = assignment.get("grading_rubric") or outline.get("grading_rubric")
+    if rubric:
+        story.extend([Paragraph("Grading Rubric", section_style), p(rubric)])
+
+    story.extend([
+        Paragraph("Email Submission", section_style),
+        p(f"To submit by email, use the subject {_assignment_email_subject(title, assignment_id)} and attach your completed PDF or document. The system uses this code to map the submission to the correct assignment, class, and subject."),
+        Spacer(1, 12),
+        p("Student Name: ________________________________     Roll No: ____________________"),
+    ])
+
+    doc.build(story)
+    pdf = buffer.getvalue()
+    buffer.close()
+    return pdf
+
+
+def _save_assignment_pdf(assignment: dict, current_user: dict, outline: Optional[Dict[str, Any]] = None) -> dict:
+    assignment_id = str(assignment["id"])
+    title = assignment.get("title") or "Assignment"
+    filename = f"{_safe_filename(title)}_{_assignment_email_code(assignment_id)}.pdf"
+    save_dir = os.path.join("uploads", "assignments", assignment_id)
+    os.makedirs(save_dir, exist_ok=True)
+    path = os.path.join(save_dir, filename)
+    pdf_bytes = _build_assignment_pdf(
+        assignment,
+        class_name=assignment.get("class_name") or "",
+        subject_name=assignment.get("subject_name") or "",
+        teacher_name=current_user.get("name") or "Teacher",
+        outline=outline,
+    )
+    with open(path, "wb") as f:
+        f.write(pdf_bytes)
+    return {
+        "attachment_url": f"/static/uploads/assignments/{assignment_id}/{filename}",
+        "attachment_filename": filename,
+    }
 
 async def _validate_assignment_scope(db, user, class_id: str, subject_id: str):
     cls = await db.get_class(class_id)
@@ -222,18 +503,39 @@ async def generate_assignment_content(
         settings = get_settings()
         client = AsyncGroq(api_key=settings.groq_api_key)
 
-        prompt = f"""You are an expert teacher. Generate a complete assignment for:
+        deliverables = ", ".join(req.deliverables or []) or "PDF or document submission"
+        prompt = f"""You are an expert teacher creating a complete, classroom-ready assignment.
+
+ASSIGNMENT CONTEXT
 - Title: {req.title}
 - Subject: {req.subject_name}
 - Class: {req.class_name or 'General'}
+- Type: {req.assignment_type}
+- Difficulty: {req.difficulty_level}
 - Total Marks: {req.total_marks}
-{f'- Topic Hint: {req.topic_hint}' if req.topic_hint else ''}
+- Estimated Duration: {req.estimated_duration or 'Teacher did not specify'}
+- Required Deliverables: {deliverables}
+{f'- Topic Focus: {req.topic_hint}' if req.topic_hint else ''}
+{f'- Extra Requirements: {req.requirements}' if req.requirements else ''}
+
+Create a proper assignment sheet that a teacher can publish directly.
+Use clear student-facing language. Split the marks across 3 to 6 meaningful tasks.
+Make the grading rubric add up to {req.total_marks} marks.
+Use the placeholder [ASG-CODE] in the email subject; the real code is assigned when the assignment is saved.
 
 Return ONLY valid JSON (no markdown fences) with this exact schema:
 {{
-  "description": "<2-3 sentence overview of the assignment>",
-  "instructions": "<detailed step-by-step instructions for students, 150-250 words>",
-  "grading_rubric": "<detailed grading rubric specifying how marks are allocated, 100-200 words>"
+  "assignment_name": "{req.title}",
+  "description": "<2-3 sentence overview>",
+  "learning_objectives": ["objective 1", "objective 2", "objective 3"],
+  "tasks": [
+    {{"title": "Task title", "details": "student-facing task details", "marks": 5}}
+  ],
+  "deliverables": ["what the student must submit"],
+  "instructions": "<complete step-by-step instructions, 180-300 words>",
+  "submission_format": "<how to submit, including PDF guidance>",
+  "email_subject_syntax": "[ASG-CODE] {req.title}",
+  "grading_rubric": "<rubric with mark allocation that totals {req.total_marks} marks>"
 }}
 """
         response = await client.chat.completions.create(
@@ -242,8 +544,8 @@ Return ONLY valid JSON (no markdown fences) with this exact schema:
                 {"role": "system", "content": "You are an expert teacher who creates clear, well-structured assignments. Always respond with valid JSON only."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.7,
-            max_tokens=1024,
+            temperature=0.65,
+            max_tokens=1800,
         )
         raw = response.choices[0].message.content.strip()
         # Strip markdown fences if present
@@ -252,11 +554,7 @@ Return ONLY valid JSON (no markdown fences) with this exact schema:
             lines = [l for l in lines if not l.strip().startswith("```")]
             raw = "\n".join(lines)
         data = json.loads(raw)
-        return {
-            "description": data.get("description", ""),
-            "instructions": data.get("instructions", ""),
-            "grading_rubric": data.get("grading_rubric", ""),
-        }
+        return _normalize_generated_payload(data, req)
     except json.JSONDecodeError as e:
         logger.error(f"JSON parse error in generate-content: {e}")
         raise HTTPException(500, "AI returned malformed content. Please try again.")
@@ -319,6 +617,8 @@ async def create_assignment(data: AssignmentCreate, current_user: dict = Depends
         "instructions": data.instructions,
         "total_marks": data.total_marks,
         "due_date": _parse_due(data.due_date),
+        "attachment_url": data.attachment_url,
+        "attachment_filename": data.attachment_filename,
         "grading_rubric": data.grading_rubric,
         "auto_grade": data.auto_grade,
         "status": data.status,
@@ -326,6 +626,14 @@ async def create_assignment(data: AssignmentCreate, current_user: dict = Depends
     created = await db.create_assignment(payload)
     if not created:
         raise HTTPException(500, "Failed to create assignment")
+    if data.generate_pdf:
+        try:
+            full_assignment = await db.get_assignment(str(created["id"])) or created
+            pdf_update = _save_assignment_pdf(full_assignment, current_user, data.generated_outline or {})
+            await db.update_assignment(str(created["id"]), pdf_update)
+            created = await db.get_assignment(str(created["id"])) or created
+        except Exception as e:
+            logger.warning(f"Assignment PDF generation failed for {created['id']}: {e}")
     return _ser(created)
 
 @router.get("/")
@@ -409,6 +717,21 @@ async def upload_attachment(assignment_id: str, file: UploadFile = File(...), cu
 
 
 # ─── Submissions ───────────────────────────────────────────────────────────────
+
+@router.post("/{assignment_id}/generate-pdf")
+async def generate_assignment_pdf(assignment_id: str, current_user: dict = Depends(require_teacher())):
+    db = await get_database()
+    await _own(db, current_user, assignment_id)
+    assignment = await db.get_assignment(assignment_id)
+    try:
+        pdf_update = _save_assignment_pdf(assignment, current_user, {})
+        await db.update_assignment(assignment_id, pdf_update)
+        updated = await db.get_assignment(assignment_id)
+        return _ser(updated or assignment)
+    except Exception as e:
+        logger.error(f"Assignment PDF generation failed for {assignment_id}: {e}")
+        raise HTTPException(500, "Failed to generate assignment PDF")
+
 
 @router.get("/{assignment_id}/submissions")
 async def list_submissions(assignment_id: str, current_user: dict = Depends(require_teacher())):
@@ -591,8 +914,9 @@ async def fetch_email_submissions(assignment_id: str, current_user: dict = Depen
         raise HTTPException(400, "Email integration is disabled.")
     from services.email_service import EmailFetcher
     fetcher = EmailFetcher(config["email_address"], config["app_password"], config["imap_host"], config["imap_port"])
+    assignment_code = _assignment_email_code(assignment_id)
     try:
-        emails = fetcher.fetch_assignment_emails(a["title"], assignment_id)
+        emails = fetcher.fetch_assignment_emails(a["title"], assignment_id, assignment_code=assignment_code)
     except Exception as e:
         raise HTTPException(500, f"Failed to fetch emails: {e}")
 
@@ -613,9 +937,14 @@ async def fetch_email_submissions(assignment_id: str, current_user: dict = Depen
             "processed_at": datetime.utcnow(),
         }
         if not student:
-            await db.create_email_submission_log({**log_base, "status": "skipped", "notes": "Sender not in class roster"})
+            await db.create_email_submission_log({**log_base, "status": "skipped", "notes": f"Sender not in class roster. Expected subject code: {assignment_code}"})
             skipped += 1
             continue
+        if not mail_data.get("body") and not mail_data.get("attachments"):
+            await db.create_email_submission_log({**log_base, "student_account_id": str(student["id"]), "status": "skipped", "notes": "No message body or attachment found"})
+            skipped += 1
+            continue
+        pdf_count = sum(1 for path in mail_data.get("attachments", []) if str(path).lower().endswith(".pdf"))
         sub = await db.create_assignment_submission({
             "assignment_id": assignment_id,
             "student_account_id": str(student["id"]),
@@ -627,7 +956,10 @@ async def fetch_email_submissions(assignment_id: str, current_user: dict = Depen
             "submitted_at": datetime.utcnow(),
         })
         if sub:
-            await db.create_email_submission_log({**log_base, "student_account_id": str(student["id"]), "status": "processed"})
+            notes = f"Mapped by {assignment_code} to {a.get('class_name') or 'selected class'} / {a.get('subject_name') or 'selected subject'}."
+            if pdf_count:
+                notes += f" Imported {pdf_count} PDF attachment{'s' if pdf_count != 1 else ''}."
+            await db.create_email_submission_log({**log_base, "student_account_id": str(student["id"]), "status": "processed", "notes": notes})
             processed += 1
         else:
             await db.create_email_submission_log({**log_base, "student_account_id": str(student["id"]), "status": "failed", "notes": "Could not create or update submission"})
@@ -635,6 +967,10 @@ async def fetch_email_submissions(assignment_id: str, current_user: dict = Depen
 
     await db.update_email_last_fetched(current_user["id"])
     return {"emails_found": len(emails), "processed": processed, "skipped": skipped,
+            "assignment_code": assignment_code,
+            "email_subject_syntax": _assignment_email_subject(a.get("title", ""), assignment_id),
+            "class_name": a.get("class_name"),
+            "subject_name": a.get("subject_name"),
             "message": f"Processed {processed} submissions, skipped {skipped} unknown senders"}
 
 @router.get("/{assignment_id}/email-logs")

@@ -152,6 +152,8 @@ jobs:
             --name "$AZURE_CONTAINER_APP" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --image "$IMAGE" \
+            --min-replicas 1 \
+            --max-replicas 1 \
             --output none
 
       - name: Smoke test health endpoint

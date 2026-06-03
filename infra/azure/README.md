@@ -10,7 +10,7 @@ This backend is designed to run on Azure Container Apps with:
 - HuggingFace/Torch caches persisted on Azure Files so cold starts do less work
 - GitHub Actions building a CI-friendly Docker image, pushing it to Azure Container Registry, then updating Container Apps
 
-The default replica range is `0..1` to save Azure for Students credit and to avoid multiple replicas writing to the same local ChromaDB files. If you later move vector search to a network service, you can raise `MaxReplicas`.
+The workflow deploys with `1..1` replicas so the API has a live backend to answer `/health`. Keep `MaxReplicas=1` while ChromaDB is file-based; if you later move vector search to a network service, you can raise it.
 
 ## 1. Provision Azure
 

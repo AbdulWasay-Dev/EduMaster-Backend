@@ -85,10 +85,17 @@ class EmailFetcher:
         mail.login(self.email_address, self.app_password)
         return mail
 
-    def fetch_assignment_emails(self, assignment_title: str, assignment_id: str, since_date: Optional[str] = None) -> List[Dict[str, Any]]:
+    def fetch_assignment_emails(
+        self,
+        assignment_title: str,
+        assignment_id: str,
+        since_date: Optional[str] = None,
+        assignment_code: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Fetch emails related to an assignment.
-        Searches for emails with subject containing the assignment title.
+        Searches for emails with subject containing the assignment title or the
+        generated assignment code, for example [ASG-ABC12345].
         Returns list of parsed email data.
         """
         results = []
@@ -96,17 +103,22 @@ class EmailFetcher:
             mail = self._connect()
             mail.select("INBOX")
 
-            # Build search criteria
-            search_parts = [f'SUBJECT "{assignment_title}"']
-            if since_date:
-                # since_date format: DD-Mon-YYYY e.g. 01-Jan-2025
-                search_parts.append(f'SINCE {since_date}')
+            search_terms = [term for term in [assignment_code, assignment_title] if term]
+            email_ids = []
+            seen_ids = set()
+            for term in search_terms:
+                search_parts = [f'SUBJECT "{term}"']
+                if since_date:
+                    # since_date format: DD-Mon-YYYY e.g. 01-Jan-2025
+                    search_parts.append(f'SINCE {since_date}')
+                search_query = "(" + " ".join(search_parts) + ")"
+                _, data = mail.search(None, search_query)
+                for eid in data[0].split() if data and data[0] else []:
+                    if eid not in seen_ids:
+                        seen_ids.add(eid)
+                        email_ids.append(eid)
 
-            search_query = "(" + " ".join(search_parts) + ")"
-            _, data = mail.search(None, search_query)
-
-            email_ids = data[0].split() if data[0] else []
-            logger.info(f"Found {len(email_ids)} emails for assignment: {assignment_title}")
+            logger.info(f"Found {len(email_ids)} emails for assignment: {assignment_title} ({assignment_code or 'no code'})")
 
             for eid in email_ids:
                 try:
