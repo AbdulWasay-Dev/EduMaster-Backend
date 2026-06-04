@@ -20,6 +20,7 @@ class RAGQueryRequest(BaseModel):
     """Request model for RAG queries"""
     subject_id: Optional[str] = Field(None, description="Subject ID to search in")
     document_ids: Optional[List[str]] = Field(None, description="Specific document IDs to search")
+    use_documents: bool = Field(default=True, description="Use uploaded documents for retrieval")
     # Accept both 'question' (backend) and 'query' (frontend) field names
     question: Optional[str] = Field(None, min_length=1, max_length=1000, description="Question to ask")
     query: Optional[str] = Field(None, min_length=1, max_length=1000, description="Query (alias for question)")
@@ -39,6 +40,7 @@ class RAGSource(BaseModel):
     document_name: str = ""
     document_title: Optional[str] = None
     chunk_text: str = ""
+    chunk_index: Optional[int] = None
     relevance_score: float = 0.0
     page_number: Optional[int] = None
 
@@ -87,8 +89,25 @@ async def query_rag(
         
         # Get services
         db = await get_database()
-        embedding_service = get_embedding_service()
         llm_service = get_llm_service()
+
+        if not request.use_documents:
+            answer_result = await llm_service.generate_general_response(effective_question)
+            if not answer_result:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to generate answer"
+                )
+
+            return RAGQueryResponse(
+                answer=answer_result["answer"],
+                sources=[],
+                confidence=answer_result.get("confidence", 0.0),
+                query=effective_question,
+                subject_id=""
+            )
+
+        embedding_service = get_embedding_service()
         
         # Determine subject scope
         subjects = await db.get_subjects(current_teacher["id"])
@@ -104,6 +123,49 @@ async def query_rag(
         else:
             # No subject_id provided — use the first available subject, or skip subject filter
             search_subject_id = subject_ids[0] if subject_ids else None
+
+        filtered_document_ids: Optional[List[str]] = None
+        if request.document_ids:
+            if not search_subject_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Select a subject before selecting documents"
+                )
+
+            filtered_document_ids = []
+            for document_id in request.document_ids:
+                document = await db.get_document(document_id)
+                if not document:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="One or more selected documents could not be found"
+                    )
+                if str(document.get("owner_id")) != str(current_teacher["id"]):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Access denied to one or more selected documents"
+                    )
+                if str(document.get("subject_id")) != str(search_subject_id):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Selected documents must belong to the selected subject"
+                    )
+                filtered_document_ids.append(str(document["id"]))
+
+            if not filtered_document_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Select at least one document or start a general chat"
+                )
+
+        if not search_subject_id:
+            return RAGQueryResponse(
+                answer="No document-backed subjects are available yet. Start a general chat or upload a document to ask questions from your materials.",
+                sources=[],
+                confidence=0.0,
+                query=effective_question,
+                subject_id=""
+            )
         
         # Generate query embedding
         query_embedding = await embedding_service.generate_query_embedding(effective_question)
@@ -118,7 +180,8 @@ async def query_rag(
             embedding=query_embedding,
             subject_id=search_subject_id,
             limit=request.top_k or 10,
-            match_threshold=0.55
+            match_threshold=0.55,
+            document_ids=filtered_document_ids,
         )
         
         if not similar_chunks:
@@ -178,6 +241,7 @@ async def query_rag(
                     document_name=document_names.get(document_id, ""),
                     document_title=document_names.get(document_id, ""),
                     chunk_text=chunk.get("text") or chunk.get("chunk_text", ""),
+                    chunk_index=chunk.get("chunk_index"),
                     relevance_score=float(chunk.get("relevance_score", chunk.get("similarity", 0.0))),
                     page_number=(chunk.get("metadata") or {}).get("page_number") if isinstance(chunk.get("metadata"), dict) else None,
                 ))
@@ -194,6 +258,7 @@ async def query_rag(
                             document_name=src.get("document_name", ""),
                             document_title=src.get("document_title"),
                             chunk_text=src.get("chunk_text", src.get("text", "")),
+                            chunk_index=src.get("chunk_index"),
                             relevance_score=float(src.get("relevance_score", src.get("similarity", 0.0))),
                         ))
                     elif isinstance(src, str):
@@ -278,7 +343,8 @@ async def generate_questions(
         relevant_chunks = await db.search_similar_chunks(
             embedding=query_embedding,
             subject_id=request.subject_id,
-            limit=20  # Get more chunks for comprehensive question generation
+            limit=20,  # Get more chunks for comprehensive question generation
+            document_ids=request.document_ids,
         )
         
         if not relevant_chunks:

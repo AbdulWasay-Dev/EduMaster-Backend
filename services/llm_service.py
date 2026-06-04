@@ -86,6 +86,35 @@ class LLMService:
         except Exception as e:
             logger.error(f"Error generating answer: {e}")
             return None
+
+    async def generate_general_response(self, question: str) -> Optional[Dict[str, Any]]:
+        """Generate a normal LLM response without document retrieval."""
+        try:
+            prompt = f"""
+You are EduMaster AI, a helpful assistant for teachers. Answer the teacher's question directly.
+
+Instructions:
+1. Be clear, practical, and concise.
+2. You may use general knowledge because no uploaded document context was selected.
+3. If the teacher asks for lesson ideas, explanations, examples, rubrics, or classroom wording, make the answer ready to use.
+4. Do not claim that your answer came from uploaded documents.
+
+Question: {question}
+
+Answer:
+"""
+            text = await self._chat(prompt)
+            if not text:
+                logger.warning("Empty response from LLM for general chat")
+                return None
+            return {
+                "answer": text.strip(),
+                "sources": [],
+                "confidence": 0.75,
+            }
+        except Exception as e:
+            logger.error(f"Error generating general response: {e}")
+            return None
     
     async def generate_questions(
         self,

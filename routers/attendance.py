@@ -115,9 +115,6 @@ async def _validate_report_scope(db: DatabaseService, teacher_id: str, class_id:
     if not subject or str(subject.get("teacher_id")) != str(teacher_id):
         raise HTTPException(status_code=403, detail="Access denied to this subject")
 
-    subject_class_id = str(subject.get("class_id")) if subject.get("class_id") else None
-    if subject_class_id and subject_class_id != class_id:
-        raise HTTPException(status_code=400, detail="Selected subject does not belong to the selected class")
     return cls, subject
 
 

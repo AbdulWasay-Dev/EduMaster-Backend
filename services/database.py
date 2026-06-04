@@ -1048,18 +1048,31 @@ class DatabaseService:
         embedding: List[float], 
         subject_id: str, 
         limit: int = 5,
-        match_threshold: float = 0.7
+        match_threshold: float = 0.7,
+        document_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Search for similar chunks using ChromaDB"""
         try:
             collection_name = f"subject_{subject_id.replace('-', '_')}"
             collection = self._chroma_client.get_or_create_collection(name=collection_name)
+
+            where_filter = None
+            if document_ids:
+                clean_document_ids = [str(doc_id) for doc_id in document_ids if doc_id]
+                if len(clean_document_ids) == 1:
+                    where_filter = {"document_id": clean_document_ids[0]}
+                elif clean_document_ids:
+                    where_filter = {"document_id": {"$in": clean_document_ids}}
+
+            query_kwargs = {
+                "query_embeddings": [embedding],
+                "n_results": limit,
+                "include": ["documents", "metadatas", "distances"],
+            }
+            if where_filter:
+                query_kwargs["where"] = where_filter
             
-            results = collection.query(
-                query_embeddings=[embedding],
-                n_results=limit,
-                include=["documents", "metadatas", "distances"]
-            )
+            results = collection.query(**query_kwargs)
             
             search_results = []
             if results["ids"] and results["ids"][0]:
@@ -1072,9 +1085,12 @@ class DatabaseService:
                     similarity = 1.0 - (distance / 2.0) if distance <= 2.0 else 0.0
                     
                     if similarity >= match_threshold:
+                        metadata = results["metadatas"][0][i] or {}
                         search_results.append({
                             "id": results["ids"][0][i],
-                            "document_id": results["metadatas"][0][i]["document_id"],
+                            "document_id": metadata.get("document_id", ""),
+                            "chunk_index": metadata.get("chunk_index"),
+                            "chunk_type": metadata.get("chunk_type"),
                             "text": results["documents"][0][i],
                             "similarity": similarity
                         })
@@ -1362,7 +1378,18 @@ class DatabaseService:
         try:
             async with self.connection() as conn:
                 rows = await conn.fetch(
-                    "SELECT * FROM submissions WHERE paper_id = $1 ORDER BY created_at DESC",
+                    """
+                    SELECT
+                        sub.*,
+                        COALESCE(NULLIF(sub.student_name, ''), st.student_name) AS student_name,
+                        st.student_id AS roll_number,
+                        st.email AS student_email,
+                        st.class_id AS student_class_id
+                    FROM submissions sub
+                    LEFT JOIN students st ON st.id = sub.student_id
+                    WHERE sub.paper_id = $1
+                    ORDER BY sub.created_at DESC
+                    """,
                     uuid.UUID(paper_id)
                 )
                 return [dict(row) for row in rows]

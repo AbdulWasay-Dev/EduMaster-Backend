@@ -822,7 +822,10 @@ def _serialize_submission(s: dict, paper: Optional[dict] = None) -> dict:
         "paper_title": (paper or {}).get("title", ""),
         "student_id": str(s.get("student_id", "")) if s.get("student_id") else None,
         "student_name": s.get("student_name", ""),
+        "roll_number": s.get("roll_number") or s.get("student_roll_number") or "",
+        "email": s.get("student_email") or s.get("email") or "",
         "class_id": str(s.get("class_id", "")) if s.get("class_id") else None,
+        "student_class_id": str(s.get("student_class_id", "")) if s.get("student_class_id") else None,
         "total_score": total_score,
         "max_score": max_score,
         "score": total_score,
@@ -912,20 +915,22 @@ async def _build_paper_class_report_data(
             class_id = candidate
             break
 
-    if not class_id or not class_info:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not determine the class for this paper. Select the class on the grading page, then export the report again.",
-        )
+    has_class_roster = bool(class_id and class_info)
+    if not has_class_roster:
+        class_id = class_id or str(class_id_override or paper.get("class_id") or (subject_info or {}).get("class_id") or "")
+        class_info = {
+            "id": class_id,
+            "name": "Unlinked Class",
+            "grade_level": "",
+            "academic_year": "",
+        }
 
-    students = await db.get_students(class_id)
+    students = await db.get_students(class_id) if has_class_roster else []
     questions = _report_questions(paper)
     student_map = {str(s.get("id")): s for s in students}
-    submissions = [
-        submission
-        for submission in raw_submissions
-        if _submission_belongs_to_report_class(submission, class_id, student_map)
-    ]
+    # Selected-paper reports should never hide graded work. When class mapping is
+    # imperfect, keep the submission as an unmatched row instead of filtering it.
+    submissions = list(raw_submissions)
 
     latest_by_student: Dict[str, Dict[str, Any]] = {}
     unmatched_submissions: List[Dict[str, Any]] = []
@@ -1053,8 +1058,9 @@ def _report_candidate_class_ids(
 
     submission_class_ids = []
     for submission in submissions:
-        if submission.get("class_id"):
-            candidate = str(submission["class_id"])
+        candidate_value = submission.get("class_id") or submission.get("student_class_id")
+        if candidate_value:
+            candidate = str(candidate_value)
             if candidate not in submission_class_ids:
                 submission_class_ids.append(candidate)
 
@@ -1102,9 +1108,9 @@ def _build_report_student_row(student: dict, submission: Optional[dict], questio
 def _build_report_unmatched_row(submission: dict, questions: List[Dict[str, Any]], index: int) -> Dict[str, Any]:
     row = {
         "student_id": submission.get("student_id") or f"unmatched-{index}",
-        "student_name": submission.get("student_name") or f"Unmatched submission {index}",
-        "roll_number": "Unmatched",
-        "email": "",
+        "student_name": submission.get("student_name") or f"Submitted sheet {index}",
+        "roll_number": submission.get("roll_number") or "Unmatched",
+        "email": submission.get("email") or submission.get("student_email") or "",
         "submitted": True,
         "status": submission.get("status") or "graded",
         "total_score": None,
